@@ -2,13 +2,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    llm_model: str = "gpt-4o"
+    llm_model: str = "gemini-2.5-flash"
     llm_temperature: float = 0.2
+
+    # Read from GOOGLE_API_KEY in .env. Needed for the LLM only -- embeddings
+    # run locally, so ingestion and retrieval work with no key at all.
+    google_api_key: str = ""
 
     sql_db_uri: str = "sqlite:///data/mock/advisor.db"
 
     vector_store_path: str = "data/index"
-    embedding_model: str = "text-embedding-3-small"
+
+    # A sentence-transformers model id, not an API model. Multilingual on
+    # purpose: half this corpus is Arabic, and an English-only embedder would
+    # return plausible-looking nonsense for it rather than failing.
+    embedding_model: str = "BAAI/bge-m3"
 
     search_api_key: str = ""
 
