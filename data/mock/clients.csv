@@ -1,0 +1,19 @@
+client_id,name,risk_profile,aum_tier
+C001,Reem Al-Otaibi,Aggressive,Ultra-HNW
+C002,Lama Al-Qahtani,Conservative,HNW
+C003,Alia Al-Sudairi,Aggressive,Ultra-HNW
+C004,Noura Al-Otaibi,Conservative,HNW
+C005,Lama Al-Mutairi,Aggressive,HNW
+C006,Alia Al-Qahtani,Aggressive,Ultra-HNW
+C007,Lama Al-Zahrani,Aggressive,Ultra-HNW
+C008,Faisal Al-Ghamdi,Aggressive,Ultra-HNW
+C009,Majed Al-Harbi,Conservative,HNW
+C010,Majed Al-Sudairi,Conservative,Ultra-HNW
+C011,Reem Al-Dosari,Balanced,Ultra-HNW
+C012,Noura Al-Zahrani,Aggressive,HNW
+C013,Omar Al-Sudairi,Aggressive,Ultra-HNW
+C014,Dana Al-Anazi,Conservative,HNW
+C015,Noura Al-Qahtani,Balanced,HNW
+C016,Lama Al-Sudairi,Balanced,Ultra-HNW
+C017,Saud Al-Dosari,Conservative,Ultra-HNW
+C018,Dana Al-Qahtani,Aggressive,Ultra-HNW
