@@ -9,7 +9,8 @@ class Settings(BaseSettings):
     # run locally, so ingestion and retrieval work with no key at all.
     google_api_key: str = ""
 
-    sql_db_uri: str = "sqlite:///data/mock/advisor.db"
+    # Written by ingestion/seed_mock_db.py, which names it advisor_mock.db.
+    sql_db_uri: str = "sqlite:///data/mock/advisor_mock.db"
 
     vector_store_path: str = "data/index"
 

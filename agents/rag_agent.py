@@ -243,8 +243,10 @@ def main(argv: list[str] | None = None) -> int:
         state["sql_result"] = SQLQueryResult(
             client_id="cli",
             holdings=[
-                ClientHolding(symbol=t, quantity=0, market_value=0,
-                              asset_class="equity")
+                # Only symbol reaches retrieval; the rest of the SQL agent's
+                # shape is filled in so the model validates.
+                ClientHolding(symbol=t, name_en="", quantity=0,
+                              market_value=0, sector="")
                 for t in args.ticker
             ],
             row_count=len(args.ticker),

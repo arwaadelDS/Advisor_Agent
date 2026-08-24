@@ -72,7 +72,7 @@ def stub_llm(monkeypatch):
 
 def holding(symbol: str) -> ClientHolding:
     return ClientHolding(
-        symbol=symbol, quantity=1, market_value=1, asset_class="equity"
+        symbol=symbol, name_en="", quantity=1, market_value=1, sector=""
     )
 
 

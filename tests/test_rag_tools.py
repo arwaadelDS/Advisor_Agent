@@ -80,7 +80,8 @@ class TestTickersOf:
 
     def test_it_reads_symbol_off_a_holding(self):
         holding = ClientHolding(
-            symbol="1180", quantity=10, market_value=100, asset_class="equity"
+            symbol="1180", name_en="Al Rajhi Bank", quantity=10,
+            market_value=100, sector="Banking",
         )
         assert rt.tickers_of([holding]) == ["1180"]
 
@@ -182,7 +183,8 @@ class TestSearchResearch:
 
     def test_holdings_accepts_the_sql_agents_own_objects(self, index):
         holding = ClientHolding(
-            symbol="2010", quantity=1, market_value=1, asset_class="equity"
+            symbol="2010", name_en="SABIC", quantity=1, market_value=1,
+            sector="Petrochemicals",
         )
         result = rt.search_research("risks", [holding], path=index)
         assert result.searched_tickers == ["2010"]
