@@ -1,0 +1,27 @@
+question,expect,language,why
+What is the recommendation on SABIC?,2026-08-06_sabic_2010,en,rating lives in the front matter block
+ما هي التوصية على سابك؟,2026-08-06_sabic_2010,ar,same rating question in Arabic
+What are the main risks to SABIC?,2026-08-06_sabic_2010,en,twelve documents have a Risks section
+ما هي المخاطر الرئيسية لسابك؟,2026-08-06_sabic_2010,ar,the Arabic half of the same ambiguity
+How large was Al Rajhi Bank's quarterly profit?,2026-08-14_alrajhi_1120,en,company note
+ما سبب ارتفاع أرباح مصرف الراجحي؟,2026-08-14_alrajhi_1120,ar,company note in Arabic
+What drove earnings growth at Saudi National Bank?,2026-08-13_snb_1180,en,company note
+ما الذي دفع نمو أرباح البنك الأهلي السعودي؟,2026-08-13_snb_1180,ar,company note in Arabic
+How is Riyad Bank's provisioning affecting returns?,2026-08-12_riyadbank_1010,en,three bank notes compete
+What is the outlook for Aramco's cash generation?,2026-08-11_aramco_2222,en,company note
+كيف تبدو التدفقات النقدية لأرامكو؟,2026-08-11_aramco_2222,ar,company note in Arabic
+Why are Saudi Kayan's accumulated losses a concern?,2026-08-05_saudikayan_2350;2026-08-17_sector-petrochemicals,en,the sector note carries the same figure
+What is stc's capital expenditure trend?,2026-08-10_stc_7010,en,two telecom notes compete
+ما هي استثمارات الاتصالات السعودية في البنية التحتية الرقمية؟,2026-08-10_stc_7010,ar,telecom note in Arabic
+How is Mobily's earnings growth trending?,2026-08-09_mobily_7020,en,the other telecom note
+What offsets Ma'aden's phosphate weakness?,2026-08-08_maaden_1211,en,company note
+ما الذي يعوض ضعف الفوسفات لدى معادن؟,2026-08-08_maaden_1211,ar,company note in Arabic
+How is Saudi Electricity funding its regulated asset growth?,2026-08-07_sec_5110;2026-08-15_sector-mining-utilities,en,the utilities sector note also covers it
+What input cost pressures does Almarai face?,2026-08-04_almarai_2280,en,company note
+What is driving revenue growth at Dr. Sulaiman Al Habib?,2026-08-03_alhabib_4013,en,company note
+What is the outlook for Saudi bank loan growth in 2026?,2026-08-18_sector-banking,en,sector note rather than any one bank
+ما هو إصلاح أسعار اللقيم وأثره على القطاع؟,2026-08-17_sector-petrochemicals,ar,sector note
+How is Vision 2030 progressing?,2026-08-16_sector-macro-vision2030,en,sector note
+ما دور قطاع التعدين في تنويع الاقتصاد؟,2026-08-15_sector-mining-utilities,ar,sector note
+ما هي توقعات نمو التمويل للبنوك السعودية في 2026؟,2026-08-18_sector-banking,ar,cross-lingual: the banking note is English only
+What is the feedstock price reform?,2026-08-17_sector-petrochemicals,en,cross-lingual: the petrochemicals note is Arabic only
