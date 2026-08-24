@@ -215,6 +215,27 @@ class TestTheEmptyAnswers:
         assert "general knowledge" in note
 
 
+class TestTheUnscopedNote:
+    """A corpus-wide search has no client, so the note must not invent one."""
+
+    def test_it_does_not_claim_nothing_covers_the_client(self, index):
+        # `covered` is empty both when a client's holdings cover nothing and
+        # when there is no client at all. Reported as the first, the prompt
+        # turns a perfectly good result into a refusal.
+        result = rt.search_research("risks", None, path=index)
+        assert result.chunks
+        assert "client" not in result.note.lower()
+
+    def test_it_does_not_tell_the_model_to_refuse(self, index):
+        note = rt.search_research("risks", None, path=index).note
+        assert "general knowledge" not in note
+
+    def test_finding_nothing_unscoped_is_said_plainly(self, index, monkeypatch):
+        monkeypatch.setattr(rt, "search", lambda *args, **kwargs: [])
+        note = rt.search_research("risks", None, path=index).note
+        assert "nothing in the index" in note.lower()
+
+
 class TestOperationalFailuresRaise:
     """A broken index is a bug to fix, not an answer to give."""
 

@@ -7,9 +7,9 @@ Only ``.symbol`` is read off a holding, so the SQL side can keep reshaping
 ``ClientHolding`` without breaking retrieval. Bare tickers and dict rows work
 too.
 
-"Found nothing" and "cover nothing" stay separate answers -- the store's
-``doc_ids=None`` vs ``[]`` distinction, carried up to where it can be said out
-loud in ``RAGSearchResult.note``. Data conditions return; a missing or stale
+"No client", "found nothing" and "cover nothing" stay three separate answers --
+the store's ``doc_ids=None`` vs ``[]`` distinction, carried up to where it can
+be said out loud in ``RAGSearchResult.note``. Data conditions return; a missing or stale
 index raises, because a deployment fault dressed up as "no results" is how an
 agent ends up telling an advisor there is no research on SABIC.
 
@@ -159,10 +159,27 @@ def coverage(tickers: Sequence[str]) -> tuple[list[str], list[str], list[str]]:
     return covered, uncovered, unknown
 
 
-def _note(covered: list[str], uncovered: list[str], unknown: list[str], found: int) -> str:
-    """The sentence the answering model reads to know what it may claim."""
+def _note(
+    covered: list[str],
+    uncovered: list[str],
+    unknown: list[str],
+    found: int,
+    scoped: bool = True,
+) -> str:
+    """The sentence the answering model reads to know what it may claim.
+
+    ``scoped`` is whether a client's holdings restricted the search at all.
+    Without it ``covered`` is empty in two unrelated situations -- a client we
+    cover no research for, and no client in context -- and the second would be
+    reported as the first. The prompt then turns a corpus-wide search that found
+    good research into a refusal.
+    """
     parts: list[str] = []
-    if not covered:
+    if not scoped:
+        # There is no client, so nothing here may talk about one.
+        if not found:
+            parts.append("Nothing in the index answers this question.")
+    elif not covered:
         parts.append(
             "No research in the index covers any of this client's holdings, so "
             "there is nothing to cite. Say so rather than answering from "
@@ -231,7 +248,7 @@ def search_research(
         query=question,
         searched_tickers=covered,
         uncovered_tickers=uncovered + unknown,
-        note=_note(covered, uncovered, unknown, len(chosen)),
+        note=_note(covered, uncovered, unknown, len(chosen), holdings is not None),
     )
 
 
