@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     # return plausible-looking nonsense for it rather than failing.
     embedding_model: str = "BAAI/bge-m3"
 
+    # Cross-encoder that re-scores the shortlist before the model sees it.
+    # Empty means no reranking: it is a separate download, and retrieval has to
+    # work without it. "BAAI/bge-reranker-v2-m3" is the multilingual one that
+    # matches the embedder above -- see ingestion/rerank.py.
+    reranker_model: str = ""
+
     search_api_key: str = ""
 
     inference_endpoint: str = ""

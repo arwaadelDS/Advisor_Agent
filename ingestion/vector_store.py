@@ -114,6 +114,17 @@ class Hit:
     score: float  # cosine similarity in [-1, 1]; higher is closer
     metadata: dict[str, Any]
 
+    # Set only once a cross-encoder has re-scored this hit. Kept beside the
+    # cosine score rather than replacing it, so a chunk that ranked badly can
+    # be traced to the stage that misranked it. See ingestion/rerank.py.
+    rerank_score: float | None = None
+
+
+    @property
+    def rank_score(self) -> float:
+        """What to order this hit by -- the cross-encoder's score if it ran."""
+        return self.score if self.rerank_score is None else self.rerank_score
+
     @property
     def title(self) -> str:
         return str(self.metadata.get("title", ""))

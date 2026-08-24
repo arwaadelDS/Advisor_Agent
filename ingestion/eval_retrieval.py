@@ -13,6 +13,10 @@ two.
 The headline is recall@5, but the split worth watching is by question language:
 if Arabic drops well below English the fault is upstream, in extraction,
 normalisation or the embedder, and no prompt work will fix it.
+
+``--rerank`` scores the same questions through the cross-encoder, so the two
+runs are directly comparable and reranking has to earn its place rather than be
+assumed to help.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
+from ingestion.rerank import CANDIDATES, DEFAULT_MODEL, RerankError, rerank
 from ingestion.vector_store import VectorStoreError, search
 
 QUESTIONS_PATH = Path("data/eval/retrieval.csv")
@@ -74,15 +79,31 @@ def load_questions(path: Path = QUESTIONS_PATH) -> list[Question]:
     ]
 
 
-def evaluate(questions: list[Question], k: int = 5, path: Path | None = None) -> list[Result]:
+def evaluate(
+    questions: list[Question],
+    k: int = 5,
+    path: Path | None = None,
+    reranker: str | None = None,
+    candidates: int = CANDIDATES,
+) -> list[Result]:
     """Run every question unfiltered and record where the right document ranked.
 
     Deliberately unfiltered: the holdings filter can only ever help, so
     measuring with it on would flatter the ranking. This is the honest number.
+
+    ``reranker`` names a cross-encoder to re-score the shortlist with. It is a
+    model id rather than a flag so the report can say which model produced the
+    number. ``candidates`` is how deep a shortlist it sees, which is the knob
+    that trades its cost against what it is able to rescue.
     """
     results = []
     for question in questions:
-        hits = search(question.question, None, k=k, path=path)
+        # A reranker can only promote what it is shown, so the shortlist has to
+        # be wider than k whenever one is running.
+        depth = max(candidates, k) if reranker else k
+        hits = search(question.question, None, k=depth, path=path)
+        if reranker:
+            hits = rerank(question.question, hits, top_n=k, name=reranker)
         ranked: list[str] = []
         for hit in hits:  # several chunks can share a document; rank documents
             if hit.doc_id not in ranked:
@@ -109,8 +130,8 @@ def _line(label: str, results: list[Result]) -> str:
     return f"  {label:10} n={len(results):<3} {scores}   MRR {mrr(results):.2f}"
 
 
-def report(results: list[Result]) -> str:
-    lines = ["Retrieval quality", _line("overall", results)]
+def report(results: list[Result], note: str = "") -> str:
+    lines = [f"Retrieval quality{note}", _line("overall", results)]
 
     languages = sorted({r.question.language for r in results})
     if len(languages) > 1:
@@ -144,17 +165,28 @@ def main(argv: list[str] | None = None) -> int:
         "--min-recall", type=float, default=0.0, metavar="F",
         help="exit non-zero if recall@%d falls below this (e.g. 0.9)" % max(CUTOFFS),
     )
+    parser.add_argument(
+        "--rerank", nargs="?", const=DEFAULT_MODEL, default=None, metavar="MODEL",
+        help=f"re-score the shortlist with a cross-encoder (default {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--candidates", type=int, default=CANDIDATES, metavar="N",
+        help="how many hits the reranker sees; its cost scales with this",
+    )
     args = parser.parse_args(argv)
 
     try:
         questions = load_questions(args.questions)
-        results = evaluate(questions, k=args.k)
-    except (FileNotFoundError, VectorStoreError) as exc:
+        results = evaluate(
+            questions, k=args.k, reranker=args.rerank, candidates=args.candidates
+        )
+    except (FileNotFoundError, VectorStoreError, RerankError) as exc:
         print("FAILED")
         print(str(exc))
         return 1
 
-    print(report(results))
+    note = f"  (reranked with {args.rerank}, top {args.candidates})" if args.rerank else ""
+    print(report(results, note))
     achieved = recall_at(results, max(CUTOFFS))
     if achieved < args.min_recall:
         print(f"\nBelow the {args.min_recall:.0%} floor.")

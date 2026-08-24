@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ingestion.catalog import Catalog, CatalogError, load_catalog
+from ingestion.rerank import RerankError, maybe_rerank
 from ingestion.vector_store import Hit, VectorStoreError, search
 from schemas import DocumentChunk, RAGSearchResult
 
@@ -34,7 +35,8 @@ DEFAULT_K = 5
 PER_DOCUMENT = 2
 
 # How many candidates to pull before capping. Enough that the cap has something
-# to choose from; small enough that it stays one query.
+# to choose from -- and, when a reranker is configured, enough for it to promote
+# something the dense search ranked low; small enough that it stays one query.
 OVERFETCH = 4
 
 
@@ -91,6 +93,9 @@ def _diversify(hits: Sequence[Hit], k: int, per_document: int) -> list[Hit]:
     remaining slots from what the cap held back. Both walk ``hits`` in score
     order, so the result is still ranked -- the cap changes which chunks are
     present, never the order they appear in.
+
+    Ordering is by ``rank_score``, which is the cross-encoder's score once a
+    reranker has run and the cosine score otherwise.
     """
     if per_document <= 0:
         return list(hits[:k])
@@ -109,7 +114,7 @@ def _diversify(hits: Sequence[Hit], k: int, per_document: int) -> list[Hit]:
     if len(kept) < k:
         kept.extend(held_back[: k - len(kept)])
     # The top-up appends lower-scoring hits, so re-sort rather than assume.
-    return sorted(kept, key=lambda hit: hit.score, reverse=True)
+    return sorted(kept, key=lambda hit: hit.rank_score, reverse=True)
 
 
 def to_chunk(hit: Hit) -> DocumentChunk:
@@ -118,7 +123,9 @@ def to_chunk(hit: Hit) -> DocumentChunk:
     return DocumentChunk(
         text=hit.text,
         source=hit.doc_id,
-        score=round(hit.score, 4),
+        # The score that decided the ordering, so the column stays monotonic
+        # whether or not a reranker ran.
+        score=round(hit.rank_score, 4),
         chunk_id=hit.chunk_id,
         doc_id=hit.doc_id,
         title=hit.title,
@@ -212,7 +219,10 @@ def search_research(
 
     try:
         hits = search(question, doc_ids, k=max(k * OVERFETCH, k), path=path)
-    except VectorStoreError as exc:
+        # Reordering only. The per-document cap below still decides what
+        # survives; the reranker decides what it is choosing between.
+        hits = maybe_rerank(question, hits)
+    except (VectorStoreError, RerankError) as exc:
         raise RagToolError(str(exc)) from exc
 
     chosen = _diversify(hits, k, per_document)
