@@ -13,6 +13,9 @@ quietly wrong:
 * Does every document still join to an instrument? A document whose ticker is
   not in instruments.csv is never retrieved and never complained about --
   see ingestion/catalog.py.
+* Is there an index, and was it built by the embedding model that is configured
+  now? Querying an index with a different model returns a confident ranking of
+  unrelated chunks -- see ingestion/vector_store.py.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from config import settings
 from ingestion import pdf_backend
 from ingestion.catalog import CatalogError, load_catalog
 from ingestion.pdf_backend import PdfBackendError
+from ingestion.vector_store import index_status
 
 DOCS_DIR = Path("data/documents")
 MANIFEST = Path("data/manifest.csv")
@@ -119,6 +123,32 @@ def report_corpus() -> int:
     return 0 if report.ok else 1
 
 
+def report_index() -> int:
+    """Report the vector index. Returns an exit code.
+
+    A missing index is not an error -- it is the normal state of a fresh clone,
+    and the fix is one command. A *stale* one is, because it answers queries
+    without complaining.
+    """
+    _out()
+    _out("Index")
+    status = index_status()
+    if not status["built"]:
+        _out(f"  not built ({status['path']})")
+        _out("  build it with: uv run python -m ingestion.build_vector_index")
+        return 0
+
+    _out(f"  {status['chunks']} chunks in {status['path']}")
+    _out(f"  built {status['built_at']} with {status['embedding_model']}")
+    if not status["matches_config"]:
+        _out(f"  ERROR:   EMBEDDING_MODEL is now {settings.embedding_model}.")
+        _out("  Vectors from two models are not comparable; queries would return")
+        _out("  confident nonsense. Rebuild with:")
+        _out("    uv run python -m ingestion.build_vector_index")
+        return 1
+    return 0
+
+
 def main() -> int:
     # These docs are Arabic; a cp1252 console would raise on the first print.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -132,10 +162,12 @@ def main() -> int:
         _out(str(exc))
         return 1
 
-    code = report_corpus()
+    # Both run: a broken catalogue should not hide a stale index. The exit code
+    # is non-zero if either is.
+    code = report_corpus() | report_index()
     _out()
-    _out("Toolchain and catalogue OK." if code == 0
-         else "Toolchain OK, but the catalogue has errors -- see above.")
+    _out("Toolchain, catalogue and index OK." if code == 0
+         else "Problems found -- see above.")
     return code
 
 
