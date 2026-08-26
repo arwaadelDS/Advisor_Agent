@@ -16,18 +16,35 @@ exposure") cannot widen the filter to names the client does not hold. With no
 The prompt carries two rules the corpus makes necessary: answer in the language
 of the question, and treat "no research covers this" as the correct answer
 rather than something to paper over. Both are asserted in the tests.
+
+The language rule needs more than the prompt. Retrieval is cross-lingual, so an
+English question often comes back with mostly Arabic extracts and the model
+answers in their language instead. ``language_instruction`` decides the answer's
+language here, from the question, and says so outright.
 """
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Any
 
+from langchain_core.messages import AIMessage
+
 from config import settings
+from ingestion.extract import ARABIC, ENGLISH, classify
 from schemas import RAGSearchResult
+from tools.llm import text_of
 from tools.rag_tools import RagToolError, format_context, search_research
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_K = 5
+
+# What to call each language in the prompt. ``classify`` can also return "und"
+# for a question with no letters in it ("2010?"), which falls back to naming no
+# language at all rather than guessing one.
+LANGUAGE_NAMES = {ARABIC: "Arabic", ENGLISH: "English"}
 
 SYSTEM_PROMPT = """\
 You are a research assistant for wealth advisors at SNB Capital.
@@ -44,7 +61,10 @@ Rules:
 - If the Note at the end of the context says no research covers the client's
   holdings, say that. That is the correct answer, not a failure.
 - Reply in the language of the advisor's question. An Arabic question gets an
-  Arabic answer, using the Arabic terms the extracts themselves use.
+  Arabic answer, using the Arabic terms the extracts themselves use. Half this
+  corpus is in the other language from the question, so expect to translate
+  what you cite. The question fixes the language of the answer; the extracts
+  never do.
 - Be brief. An advisor is reading this between calls.
 """
 
@@ -54,7 +74,7 @@ Advisor's question:
 
 Research extracts:
 {context}
-"""
+{language}"""
 
 
 class RagAgentError(RuntimeError):
@@ -148,6 +168,19 @@ def _llm():
     )
 
 
+def language_instruction(question: str) -> str:
+    """A line naming the language to answer in, or "" if the script is unclear.
+
+    The system prompt already says to answer in the question's language, and on
+    its own that is not enough: retrieval is cross-lingual on purpose, so an
+    English question routinely returns mostly Arabic extracts, and the model
+    then follows the evidence rather than the instruction. Naming the language
+    outright, decided here rather than inferred there, is what actually holds.
+    """
+    name = LANGUAGE_NAMES.get(classify(question))
+    return f"\nWrite your answer in {name}.\n" if name else ""
+
+
 def build_messages(question: str, result: RAGSearchResult) -> list[tuple[str, str]]:
     """The exact prompt sent to the model, as a value a test can inspect.
 
@@ -157,14 +190,17 @@ def build_messages(question: str, result: RAGSearchResult) -> list[tuple[str, st
     """
     return [
         ("system", SYSTEM_PROMPT),
-        ("user", USER_PROMPT.format(question=question, context=format_context(result))),
+        ("user", USER_PROMPT.format(
+            question=question,
+            context=format_context(result),
+            language=language_instruction(question),
+        )),
     ]
 
 
 def answer(question: str, result: RAGSearchResult) -> str:
     """Compose a cited answer from retrieved research."""
-    response = _llm().invoke(build_messages(question, result))
-    return str(getattr(response, "content", response)).strip()
+    return text_of(_llm().invoke(build_messages(question, result)))
 
 
 def rag_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -173,17 +209,42 @@ def rag_node(state: dict[str, Any]) -> dict[str, Any]:
     Returns both the structured ``rag_context`` -- so a later node can render
     citations properly instead of scraping them out of prose -- and the answer
     as a message.
+
+    Degrades instead of raising, like the other three nodes: a rate limit or a
+    dropped connection here would otherwise take down the whole turn, and the
+    advisor would see a traceback where an apology belongs.
+
+    The two failures are kept apart because they leave different things usable.
+    If retrieval failed there is nothing to show. If retrieval worked and only
+    the model call failed, ``rag_context`` still holds the chunks and their
+    citations, so the interface can show the research even when no one managed
+    to summarise it.
     """
     question = question_of(state)
-    result = retrieve(state)
+    try:
+        result = retrieve(state)
+    except (RagAgentError, RagToolError) as exc:
+        logger.error("rag_node retrieval failed: %s", exc, exc_info=True)
+        return {
+            "rag_context": None,
+            "messages": [AIMessage(
+                content="I couldn't search the research library just now. "
+                        "Please try again shortly.",
+                name="rag_agent",
+            )],
+            "next_agent": None,
+        }
+
     try:
         text = answer(question, result)
-    except RagToolError as exc:
-        raise RagAgentError(str(exc)) from exc
+    except Exception as exc:
+        logger.error("rag_node could not compose an answer: %s", exc, exc_info=True)
+        text = ("I found research on this but couldn't summarise it just now. "
+                "The extracts are listed below.")
+
     return {
         "rag_context": result,
-        "messages": [*(state.get("messages") or []), {"role": "assistant",
-                                                      "content": text}],
+        "messages": [AIMessage(content=text, name="rag_agent")],
         "next_agent": None,
     }
 

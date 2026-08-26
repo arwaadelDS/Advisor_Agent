@@ -21,6 +21,8 @@ from ingestion.chunk import chunk_corpus
 from ingestion.extract import extract_corpus
 from ingestion import vector_store as vs
 from schemas import ClientHolding, RAGSearchResult, SQLQueryResult
+from tools.llm import text_of
+from tools.rag_tools import RagToolError
 from agents import rag_agent as ra
 
 DIM = 32
@@ -74,6 +76,22 @@ def holding(symbol: str) -> ClientHolding:
     return ClientHolding(
         symbol=symbol, name_en="", quantity=1, market_value=1, sector=""
     )
+
+
+class _Response:
+    """A chat reply, in either shape a Gemini generation returns."""
+
+    def __init__(self, content, text=None):
+        self.content = content
+        if text is not None:
+            self.text = text
+
+
+def _raise(message: str, exc_type: type[Exception] = Exception):
+    """A stand-in for a call that fails, whatever arguments it is handed."""
+    def fail(*args, **kwargs):
+        raise exc_type(message)
+    return fail
 
 
 def state_for(question: str, *symbols: str) -> dict:
@@ -216,14 +234,20 @@ class TestRagNode:
 
     def test_it_appends_the_answer_as_a_message(self, index, stub_llm):
         update = ra.rag_node(state_for("risks", "2010"))
-        assert update["messages"][-1]["content"] == "Risks are X [1]."
+        assert update["messages"][-1].content == "Risks are X [1]."
 
-    def test_it_keeps_the_conversation_so_far(self, index, stub_llm):
-        # AdvisorState.messages is a plain list, so LangGraph overwrites it --
-        # the node must return the whole conversation, not only its own turn.
+    def test_it_returns_only_its_own_turn(self, index, stub_llm):
+        # AdvisorState.messages carries an add_messages reducer, so returning
+        # the conversation back would be the node re-sending what it was given.
         update = ra.rag_node(state_for("risks", "2010"))
-        assert len(update["messages"]) == 2
+        assert len(update["messages"]) == 1
         assert update["next_agent"] is None
+
+    def test_the_answer_is_tagged_with_the_agent_that_wrote_it(self, index, stub_llm):
+        # Three agents write into one transcript; an interface showing which
+        # one answered needs this to come from the node, not from guesswork.
+        update = ra.rag_node(state_for("risks", "2010"))
+        assert update["messages"][-1].name == "rag_agent"
 
     def test_the_model_only_sees_the_clients_own_research(self, index, stub_llm):
         ra.rag_node(state_for("risks", "2010"))
@@ -235,6 +259,114 @@ class TestRagNode:
             if entry.doc_id not in allowed
         ]
         assert not any(doc_id in user for doc_id in excluded)
+
+
+class TestTheAnswerLanguage:
+    """Retrieval is cross-lingual, so the extracts routinely disagree with the
+    question about what language this is in. Left to the system prompt alone the
+    model follows the extracts -- an English question about SABIC came back in
+    Arabic, twice out of two. The instruction is decided here instead.
+    """
+
+    def test_an_english_question_names_english(self):
+        assert ra.language_instruction("What are the risks for SABIC?") == \
+            "\nWrite your answer in English.\n"
+
+    def test_an_arabic_question_names_arabic(self):
+        assert "Arabic" in ra.language_instruction("ما هي مخاطر سابك؟")
+
+    def test_a_question_with_no_letters_names_nothing(self):
+        # "2010?" is not evidence of any language. Better to fall back on the
+        # system prompt's rule than to assert a guess.
+        assert ra.language_instruction("2010?") == ""
+
+    def test_the_instruction_reaches_the_model(self, index):
+        result = ra.retrieve(state_for("risks", "2010"))
+        _, (_, user) = ra.build_messages("What are the risks?", result)
+        assert "Write your answer in English." in user
+
+    def test_arabic_extracts_do_not_change_an_english_question(self, index):
+        # The point of the whole mechanism: the language is read off the
+        # question, never off what retrieval happened to return.
+        arabic_ish = ra.retrieve(state_for("ما هي المخاطر", "2010"))
+        _, (_, user) = ra.build_messages("What are the risks?", arabic_ish)
+        assert "Write your answer in English." in user
+
+    def test_the_prompt_still_says_the_extracts_do_not_set_the_language(self):
+        (_, system), _ = ra.build_messages("q", RAGSearchResult(chunks=[]))
+        assert "The question fixes the language of the answer" in \
+            " ".join(system.split())
+
+
+class TestReadingTheModelsReply:
+    """Gemini 2.5 returns a string; Gemini 3.x returns a list of typed blocks.
+
+    The project has to move to 3.x -- 2.5 is closed to new API keys -- and the
+    old ``str(response.content)`` would have quietly shown the advisor a repr
+    of a dict full of base64 rather than a sentence.
+    """
+
+    def test_a_plain_string_reply(self):
+        assert text_of(_Response("Risks are X [1].")) == "Risks are X [1]."
+
+    def test_a_block_list_reply(self):
+        blocks = [{"type": "text", "text": "Risks are X [1].",
+                   "extras": {"signature": "EvEDCu4DARFN..."}}]
+        assert text_of(_Response(blocks)) == "Risks are X [1]."
+
+    def test_the_signature_blob_never_reaches_the_advisor(self):
+        blocks = [{"type": "text", "text": "hello",
+                   "extras": {"signature": "EvEDCu4DARFN..."}}]
+        assert "EvED" not in text_of(_Response(blocks))
+
+    def test_several_blocks_are_joined(self):
+        blocks = [{"type": "text", "text": "one "}, {"type": "text", "text": "two"}]
+        assert text_of(_Response(blocks)) == "one two"
+
+    def test_non_text_blocks_are_dropped(self):
+        blocks = [{"type": "thinking", "text": "hmm"}, {"type": "text", "text": "answer"}]
+        assert text_of(_Response(blocks)) == "answer"
+
+    def test_the_text_property_wins_when_present(self):
+        assert text_of(_Response(["ignored"], text="ready")) == "ready"
+
+
+class TestTheNodeDegradesInsteadOfRaising:
+    """A rate limit or a dropped connection must not take down the turn.
+
+    The other three nodes already catch and apologise; this one used to raise,
+    which surfaced a traceback where the advisor expects a sentence. Found by
+    running the real graph until Gemini's free-tier quota ran out.
+    """
+
+    def test_a_failed_model_call_still_returns_a_message(self, index, monkeypatch):
+        monkeypatch.setattr(ra, "answer", _raise("429 RESOURCE_EXHAUSTED"))
+        update = ra.rag_node(state_for("risks", "2010"))
+        assert update["messages"][-1].content
+
+    def test_a_failed_model_call_keeps_the_research(self, index, monkeypatch):
+        # Retrieval succeeded -- only the summary failed. The chunks and their
+        # citations are still worth showing.
+        monkeypatch.setattr(ra, "answer", _raise("429 RESOURCE_EXHAUSTED"))
+        update = ra.rag_node(state_for("risks", "2010"))
+        assert update["rag_context"].chunks
+
+    def test_a_failed_retrieval_returns_no_research(self, index, monkeypatch):
+        monkeypatch.setattr(ra, "retrieve", _raise("index is stale", RagToolError))
+        update = ra.rag_node(state_for("risks", "2010"))
+        assert update["rag_context"] is None
+        assert update["messages"][-1].content
+
+    def test_the_raw_error_is_not_shown_to_the_advisor(self, index, monkeypatch):
+        # "429 RESOURCE_EXHAUSTED" means nothing to someone between calls.
+        monkeypatch.setattr(ra, "answer", _raise("429 RESOURCE_EXHAUSTED"))
+        update = ra.rag_node(state_for("risks", "2010"))
+        assert "RESOURCE_EXHAUSTED" not in update["messages"][-1].content
+
+    def test_an_empty_question_does_not_raise_either(self, index):
+        update = ra.rag_node({"messages": []})
+        assert update["rag_context"] is None
+        assert update["messages"][-1].content
 
 
 class TestTheModelIsOptional:
