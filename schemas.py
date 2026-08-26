@@ -36,13 +36,40 @@ class RewrittenQuery(BaseModel):
     corrections: list[str] = []
     ambiguous: list[str] = []
     needs_clarification: bool = False
-      
+
+
 class SQLQueryResult(BaseModel):
     client_id: str
     holdings: list[ClientHolding] = Field(default_factory=list)
     row_count: int = 0
     query_used: Optional[str] = None
     error: Optional[str] = None
+
+
+class GeneratedQuery(BaseModel):
+    """sql_tools.generate_query's structured-output contract -- what the
+    LLM returns before validation/execution ever run."""
+    sql: str
+    confidence: float
+    needs_clarification: bool = False
+    clarification_question: Optional[str] = None
+
+
+class PipelineResult(BaseModel):
+    """sql_tools.run_query_pipeline's return type. .rewrite and .answer
+    are set by agents/sql_agent.run_sql_agent AFTER construction (they
+    default here rather than being required, since run_query_pipeline
+    itself never sets them -- it doesn't know about rewriting or answer
+    synthesis, those are one layer up)."""
+    question: str
+    generated: GeneratedQuery
+    result: Optional[SQLQueryResult] = None
+    validation_error: Optional[str] = None
+    repair_attempts: int = 0
+    needs_clarification: bool = False
+    clarification_question: Optional[str] = None
+    rewrite: Optional[RewrittenQuery] = None
+    answer: str = ""
 
 
 class DocumentChunk(BaseModel):
@@ -95,4 +122,3 @@ class SearchResult(BaseModel):
     """Output of the web search agent."""
     summary: str
     sources: list[str]
-

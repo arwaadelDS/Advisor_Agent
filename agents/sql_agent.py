@@ -1,7 +1,9 @@
 """Top-level SQL agent: wires query rewriting into the SQL sub-pipeline,
 composes a final prose answer (mirroring agents/rag_agent.py's pattern of
-"structured data in, cited/grounded prose out"), and exposes a single
-@tool entrypoint to the Supervisor.
+"structured data in, cited/grounded prose out"), and exposes both a
+LangGraph node (sql_agent_node) for the Supervisor's graph and a
+standalone @tool entrypoint (query_client_portfolio) for a tool-calling
+caller.
 
 Orchestration boundary:
 - tools/query_rewriter.py -> normalizes/corrects the raw question
@@ -9,8 +11,8 @@ Orchestration boundary:
   (a cohesive, independently-testable unit; left where it is)
 - this file -> decides the order (rewrite first), decides what happens
   when rewriting itself surfaces ambiguity (stop before any SQL is
-  generated), composes the final advisor-facing answer, and is the only
-  place wrapped as a LangChain @tool for the Supervisor to call.
+  generated), composes the final advisor-facing answer, and exposes the
+  node/tool entrypoints other layers call.
 
 Answer synthesis rule, same principle as rag_agent.py: the LLM composing
 the final sentence only ever sees the already-retrieved holdings data (or
@@ -18,9 +20,15 @@ the error/ambiguity state) -- never the raw question alone -- so it can't
 invent figures that aren't in the retrieved rows.
 """
 
+import logging
+import re
+
+from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from agents.rag_agent import question_of
+from graph.state import AdvisorState
 from tools.llm import get_llm
 from tools.query_rewriter import rewrite_question
 from tools.sql_tools import (
@@ -30,6 +38,8 @@ from tools.sql_tools import (
     MAX_REPAIR_ATTEMPTS,
 )
 from schemas import PipelineResult, GeneratedQuery, SQLQueryResult, ClientHolding
+
+logger = logging.getLogger(__name__)
 
 
 ANSWER_SYSTEM_PROMPT = """You are a portfolio assistant for wealth advisors.
@@ -48,6 +58,14 @@ Rules:
 - Reply in the language of the advisor's question.
 - Be concise -- an advisor is reading this between calls.
 """
+_RESEARCH_INTENT_PATTERN = re.compile(
+    r"\b(outlook|research|opinion|recommend|risk|analysis|should i|"
+    r"think about|view on|perspective)\b", re.IGNORECASE,
+)
+
+
+def _wants_research_followup(question: str) -> bool:
+    return bool(_RESEARCH_INTENT_PATTERN.search(question))
 
 
 def _format_holdings_for_prompt(holdings: list[ClientHolding]) -> str:
@@ -134,11 +152,66 @@ def run_sql_agent(question: str,
         max_rows=max_rows,
     )
     result.rewrite = rewrite
-    result.question = question  
+    result.question = question
     result.answer = synthesize_answer(
         question, result.result, clarification_question=result.clarification_question
     )
     return result
+
+
+def sql_agent_node(state: AdvisorState) -> dict:
+    """Worker node: answers questions about a client's portfolio holdings.
+
+    Reuses agents.rag_agent.question_of for the same message-shape-tolerant
+    extraction rag_node relies on, rather than re-implementing it here --
+    one place decides how "the advisor's question" is pulled out of
+    ``messages``, so the two node files can't drift on that behavior.
+
+    On any failure (LLM error, DB error, etc.) this degrades to a plain
+    apology message rather than letting an exception crash the graph turn
+    -- same resilience pattern as supervisor_node and search_agent_node.
+
+    If the question implies wanting research/opinion on the retrieved
+    holdings (not just the raw numbers), next_agent is set to "rag_agent"
+    so the graph continues into research scoped to exactly those holdings
+    in the same turn, instead of requiring a separate follow-up question.
+    """
+    question = question_of(state)
+    if not question.strip():
+        return {
+            "messages": [AIMessage(content="I didn't receive a question about the portfolio.",
+                                    name="sql_agent")],
+            "sql_result": None,
+            "next_agent": None,
+        }
+
+    try:
+        pipeline_result = run_sql_agent(question)
+    except Exception as e:
+        logger.error(f"sql_agent_node failed: {e}", exc_info=True)
+        return {
+            "messages": [AIMessage(
+                content="I ran into an issue retrieving the portfolio data. "
+                        "Could you try rephrasing, or try again shortly?",
+                name="sql_agent",
+            )],
+            "sql_result": None,
+            "next_agent": None,
+        }
+
+    should_continue_to_rag = (
+        pipeline_result.result is not None
+        and pipeline_result.result.error is None
+        and bool(pipeline_result.result.holdings)
+        and _wants_research_followup(question)
+    )
+
+    return {
+        "sql_result": pipeline_result.result,
+        "messages": [AIMessage(content=pipeline_result.answer, name="sql_agent")],
+        "next_agent": "rag_agent" if should_continue_to_rag else None,
+    }
+
 
 class QueryClientPortfolioInput(BaseModel):
     question: str = Field(

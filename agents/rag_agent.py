@@ -111,8 +111,9 @@ def retrieve(state: dict[str, Any], k: int = DEFAULT_K) -> RAGSearchResult:
     if not question.strip():
         raise RagAgentError("no advisor question found in state['messages']")
 
-    result = search_research(question, holdings_of(state), k=k)
-    if holdings_of(state) is None:
+    holdings = holdings_of(state)
+    result = search_research(question, holdings, k=k)
+    if holdings is None:
         # Said in the context block, not just in the logs: without it the model
         # would present sector research as though it were about this client.
         scope = (

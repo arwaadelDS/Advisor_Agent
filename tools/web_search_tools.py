@@ -1,4 +1,6 @@
 import logging
+from functools import lru_cache
+
 from config import settings
 from langchain_core.tools import tool
 from openai import OpenAI
@@ -6,11 +8,15 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 logger = logging.getLogger(__name__)
 
-_search_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=settings.search_api_key,
-    timeout=15.0,
-)
+
+@lru_cache(maxsize=1)
+def _get_search_client() -> OpenAI:
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=settings.search_api_key,
+        timeout=15.0,
+    )
+
 
 @retry(
     wait=wait_exponential(multiplier=1, min=2, max=8),
@@ -20,8 +26,8 @@ _search_client = OpenAI(
 )
 def fetch_web_results(query: str) -> str:
     """Queries OpenRouter web plugin for real-time market and news updates."""
-    response = _search_client.chat.completions.create(
-        model=settings.llm_model,
+    response = _get_search_client().chat.completions.create(
+        model=settings.search_model,
         max_tokens=500,
         messages=[
             {

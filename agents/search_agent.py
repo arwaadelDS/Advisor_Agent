@@ -1,8 +1,9 @@
 import logging
-from config import settings
+from functools import lru_cache
+
 from graph.state import AdvisorState
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from tools.llm import get_llm
 from tools.web_search_tools import search_web
 
 logger = logging.getLogger(__name__)
@@ -10,13 +11,10 @@ logger = logging.getLogger(__name__)
 SEARCH_AGENT_PROMPT = """You are a market news helper for SNB Capital advisors.
 Summarize the search results simply."""
 
-_search_llm = ChatOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=settings.inference_endpoint or settings.search_api_key,
-    model=settings.llm_model,
-    temperature=settings.llm_temperature,
-    max_tokens=500
-)
+
+@lru_cache(maxsize=1)
+def _get_search_llm():
+    return get_llm()
 
 
 def search_agent_node(state: AdvisorState) -> dict:
@@ -38,8 +36,8 @@ def search_agent_node(state: AdvisorState) -> dict:
         raw_search = "Unable to retrieve real-time search context due to a connection error."
 
     prompt = f"Advisor Query: {query}\n\nSearch Context:\n{raw_search}\n\nProvide an executive briefing:"
-    
-    response = _search_llm.invoke([
+
+    response = _get_search_llm().invoke([
         SystemMessage(content=SEARCH_AGENT_PROMPT),
         HumanMessage(content=prompt),
     ])

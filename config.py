@@ -27,6 +27,12 @@ class Settings(BaseSettings):
 
     search_api_key: str = ""
 
+    # OpenRouter model IDs are namespaced (e.g. "google/gemini-2.5-flash"),
+    # unlike llm_model above which is a bare Gemini model name used for
+    # direct Google API calls. Kept separate since reusing llm_model against
+    # OpenRouter's API fails -- see tools/web_search_tools.py.
+    search_model: str = "google/gemini-2.5-flash"
+
     inference_endpoint: str = ""
 
     # Absolute path to a pdftotext executable. Leave empty to auto-discover.
