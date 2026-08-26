@@ -1,7 +1,6 @@
-
-
-#building the database 3 tables and connecting them together in holdings by (clien_id,ticker)to be foriegn keys
-
+# building the database 3 tables and connecting them together in 
+# holdings by (client_id,ticker) to be foreign keys
+#creating view for the agent 
 import csv
 from pathlib import Path
 from sqlalchemy import create_engine, text
@@ -35,6 +34,8 @@ def seed():
     holdings = read_csv("holdings.csv")
 
     with engine.begin() as conn:
+        conn.execute(text("DROP VIEW IF EXISTS client_portfolio_view"))
+
         for stmt in CREATE_TABLES.strip().split(";"):
             if stmt.strip():
                 conn.execute(text(stmt))
