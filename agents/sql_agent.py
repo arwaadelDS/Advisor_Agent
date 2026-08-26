@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from agents.rag_agent import question_of
 from graph.state import AdvisorState
-from tools.llm import get_llm
+from tools.llm import get_llm, text_of
 from tools.query_rewriter import rewrite_question
 from tools.sql_tools import (
     run_query_pipeline,
@@ -108,7 +108,7 @@ def synthesize_answer(question: str, sql_result: SQLQueryResult | None,
         {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ])
-    return str(getattr(resp, "content", resp)).strip()
+    return text_of(resp)
 
 
 def run_sql_agent(question: str,

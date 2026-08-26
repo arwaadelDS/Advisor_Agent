@@ -14,7 +14,7 @@ wrong guess against client/portfolio data is worse than asking the user.
 from pydantic import BaseModel
 from sqlalchemy import text
 from rapidfuzz import process, fuzz
-from tools.llm import get_llm
+from tools.llm import get_llm, text_of
 from tools.db import agent_engine
 from schemas import RewrittenQuery
 
@@ -38,7 +38,7 @@ def llm_rewrite(question: str) -> str:
     # downstream into generate_query's LLM call and crash the whole
     # pipeline with "contents are required" -- fall back to the original
     # question text instead of ever returning "".
-    content = (resp.content or "").strip()
+    content = text_of(resp)
     return content if content else question
 
 
