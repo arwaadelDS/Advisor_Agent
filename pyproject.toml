@@ -13,8 +13,10 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "pypdf>=6.16.1",
     "python-dotenv>=1.2.3",
+    "rapidfuzz>=3.14.5",
     "sentence-transformers>=6.0.0",
     "sqlalchemy>=2.0.52",
+    "sqlglot>=30.17.0",
     "uvicorn[standard]>=0.52.3",
 ]
 
@@ -28,4 +30,8 @@ packages = ["agents", "tools", "graph", "ingestion"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+]
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests that hit the real DB/LLM (run with -m integration)",
 ]
