@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.py[cod]
+*$py.class
 
 # Built vector index (rebuildable from data/documents via ingestion).
 data/index/
