@@ -1,0 +1,15 @@
+[server]
+# Streamlit's source watcher walks every module in sys.modules on each rerun to
+# decide what to watch. transformers loads its submodules lazily, so merely
+# asking a module for __path__ imports it -- including vision models like yolos
+# and zoedepth, which want torchvision. sentence-transformers does not install
+# torchvision, so the watcher prints a wall of ModuleNotFoundError tracebacks
+# that have nothing to do with this app and do not affect it.
+#
+# The cost of turning it off: the page no longer reloads by itself when a source
+# file is saved. Press R in the browser, or set this back to "auto" while
+# editing the UI.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
