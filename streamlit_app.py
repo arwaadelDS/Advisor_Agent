@@ -19,12 +19,25 @@ the research it managed to retrieve before the model call died.
 
 from __future__ import annotations
 
+import logging
 import re
 
 import streamlit as st
 
 # Stdlib underneath, so unlike the graph this is safe to import at module level.
 from tools.citations import check_citations
+
+# The modules log; nothing configured a handler, so until now everything below
+# WARNING was dropped -- including the supervisor's routing line, which is the
+# one worth watching during a demo. Third-party loggers stay at WARNING to keep
+# the per-request chatter out. Configured here because this is the entry point:
+# doing it inside agents/ or tools/ would hijack logging for pytest too.
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(levelname)s %(name)s: %(message)s",
+)
+for _package in ("agents", "graph", "ingestion", "tools"):
+    logging.getLogger(_package).setLevel(logging.INFO)
 
 st.set_page_config(page_title="SNB Capital Advisor Console",
                    page_icon="\N{BANK}", layout="wide")
