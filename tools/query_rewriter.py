@@ -18,7 +18,23 @@ from tools.llm import get_llm, text_of
 from tools.db import agent_engine
 from schemas import RewrittenQuery
 
+import re
+import unicodedata
 
+# Arabic text can encode visually identical characters differently
+# (composed vs decomposed forms, tatweel/kashida elongation, diacritics)
+# depending on how the source data was authored. Two strings that look
+# identical to a person can fail to match at all under raw byte
+# comparison. Normalizing before every fuzzy comparison -- the same
+# role str.lower plays for the categorical fields -- prevents a real
+# substring match (like "السعودية" inside "السعودية للكهرباء") from
+# being silently invisible to the scorer.
+_ARABIC_DIACRITICS = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u0640]")
+
+def _normalize_arabic(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = _ARABIC_DIACRITICS.sub("", text)
+    return text
 
 REWRITE_SYSTEM_PROMPT = """You correct spelling, grammar, and phrasing in a user's
 question about client portfolio data. Do NOT change the meaning, add filters,
@@ -55,6 +71,16 @@ ENTITY_FIELDS = {
     "instrument_name_en": ("instruments", "name_en"),
     "instrument_name_ar": ("instruments", "name_ar"),
 }
+
+# How many points below the top score still counts as "tied" when deciding
+# whether an entity match is ambiguous. Strict equality is too strict for
+# fuzzy partial-ratio scores: the same kind of generic/shared fragment (a
+# nationality adjective, a common surname, a word like "Bank") can score a
+# couple of points differently purely because of the length of the
+# surrounding candidate string -- that difference doesn't reflect a real
+# difference in how ambiguous the match actually is, so a small tolerance
+# band is used instead of an exact score match.
+TIE_TOLERANCE = 5.0
 
 
 def _load_distinct_values(table: str, column: str) -> list[str]:
@@ -136,13 +162,12 @@ def fuzzy_correct_categorical(question: str, categorical: dict[str, list[str]],
 def fuzzy_correct_entities(question: str, entities: dict[str, list[str]],
                             threshold: int = 85) -> tuple[str, list[str], list[str]]:
     """Whole-phrase / sliding-window matching for multi-word proper nouns.
-    Matches are flagged as hints, never auto-substituted into the question —
-    silently rewriting free text around a proper noun risks mangling the
-    sentence or guessing wrong on an ambiguous partial name. When the best
-    score found for a field ties between two or more real entities (a
-    shared family name, a common word like 'Bank', a near-identical
-    suffix), all tied candidates are reported in `ambiguous` instead of
-    picking one and presenting it as a confident single match."""
+    Tries every window size and keeps the one that produces the HIGHEST
+    top score, rather than the largest window that merely clears the
+    threshold -- a large window that happens to mix in filler words
+    (e.g. "related to <name>") can dilute partial_ratio's score below
+    what the exact fragment alone would achieve, so "largest first" alone
+    can pick a noisier, lower-confidence match over a cleaner one."""
     corrections = []
     ambiguous = []
     tokens = [t.strip(".,?!") for t in question.split()]
@@ -150,9 +175,13 @@ def fuzzy_correct_entities(question: str, entities: dict[str, list[str]],
 
     for field, values in entities.items():
         max_words = max(len(v.split()) for v in values)
-        best_score_per_value: dict[str, float] = {}
+
+        best_overall_score = -1.0
+        best_overall_scores: dict[str, float] = {}
 
         for window_size in range(1, min(max_words, n) + 1):
+            best_score_per_value: dict[str, float] = {}
+
             for i in range(n - window_size + 1):
                 candidate = " ".join(tokens[i:i + window_size])
                 if len(candidate) < 3:
@@ -163,29 +192,35 @@ def fuzzy_correct_entities(question: str, entities: dict[str, list[str]],
                     if score > best_score_per_value.get(match, 0):
                         best_score_per_value[match] = score
 
-        if not best_score_per_value:
+            if not best_score_per_value:
+                continue
+
+            window_top_score = max(best_score_per_value.values())
+            if window_top_score > best_overall_score:
+                best_overall_score = window_top_score
+                best_overall_scores = best_score_per_value
+
+        if best_overall_score < threshold:
             continue
 
-        top_score = max(best_score_per_value.values())
-        if top_score < threshold:
-            continue
-
-        tied = sorted(v for v, s in best_score_per_value.items() if s == top_score)
+        tied = sorted(
+            v for v, s in best_overall_scores.items()
+            if best_overall_score - s <= TIE_TOLERANCE
+        )
 
         if len(tied) == 1:
             match = tied[0]
             if match.lower() not in question.lower():
                 corrections.append(
-                    f"possible entity match: '{match}' ({field}, {top_score:.1f}%) — not auto-replaced"
+                    f"possible entity match: '{match}' ({field}, {best_overall_score:.1f}%) — not auto-replaced"
                 )
         else:
             ambiguous.append(
-                f"possible entity match is ambiguous ({field}, {top_score:.1f}%) between: "
+                f"possible entity match is ambiguous ({field}, {best_overall_score:.1f}%) between: "
                 f"{', '.join(tied)} — not auto-replaced"
             )
 
     return question, corrections, ambiguous
-
 
 def rewrite_question(question: str) -> RewrittenQuery:
     llm_fixed = llm_rewrite(question)

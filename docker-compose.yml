@@ -1,0 +1,14 @@
+services:
+  advisor-console:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - hf-cache:/app/.cache/huggingface
+      - ./data/index:/app/data/index
+      - ./data/mock:/app/data/mock
+
+volumes:
+  hf-cache:

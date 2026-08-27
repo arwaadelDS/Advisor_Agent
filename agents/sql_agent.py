@@ -22,11 +22,11 @@ invent figures that aren't in the retrieved rows.
 
 import logging
 import re
-
+from schemas import AggregateQueryResult
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-
+from tools.aggregate_sql_tools import is_aggregate_question, run_aggregate_query_pipeline
 from agents.rag_agent import question_of
 from graph.state import AdvisorState
 from tools.llm import get_llm, text_of
@@ -59,10 +59,9 @@ Rules:
 - Be concise -- an advisor is reading this between calls.
 """
 _RESEARCH_INTENT_PATTERN = re.compile(
-    r"\b(outlook|research|opinion|recommend|risk|analysis|should i|"
+    r"\b(outlook|research|opinion|recommend\w*|risk\w*|analysis|should i|"
     r"think about|view on|perspective)\b", re.IGNORECASE,
 )
-
 
 def _wants_research_followup(question: str) -> bool:
     return bool(_RESEARCH_INTENT_PATTERN.search(question))
@@ -101,6 +100,34 @@ def synthesize_answer(question: str, sql_result: SQLQueryResult | None,
         user_content = (
             f"The advisor asked: {question}\n\n"
             f"Holdings data:\n{holdings_text}\n\n"
+            f"Answer the question using only this data."
+        )
+
+    resp = get_llm().invoke([
+        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ])
+    return text_of(resp)
+
+def synthesize_aggregate_answer(question: str, result: AggregateQueryResult) -> str:
+    if result.clarification_question:
+        user_content = (
+            f"The advisor asked: {question}\n\n"
+            f"This question is ambiguous: {result.clarification_question}\n"
+            f"Ask the advisor to clarify, briefly."
+        )
+    elif result.error:
+        user_content = (
+            f"The advisor asked: {question}\n\n"
+            f"The data could not be retrieved. Internal note: {result.error}\n"
+            f"Explain briefly and professionally that this couldn't be "
+            f"retrieved, without repeating raw technical details."
+        )
+    else:
+        rows_text = "\n".join(str(r) for r in result.rows) or "(no rows)"
+        user_content = (
+            f"The advisor asked: {question}\n\n"
+            f"Query result:\n{rows_text}\n\n"
             f"Answer the question using only this data."
         )
 
@@ -175,6 +202,13 @@ def sql_agent_node(state: AdvisorState) -> dict:
     holdings (not just the raw numbers), next_agent is set to "rag_agent"
     so the graph continues into research scoped to exactly those holdings
     in the same turn, instead of requiring a separate follow-up question.
+
+    Cross-client / computed-figure questions ("total value across all
+    clients", "how many clients are Aggressive risk") are routed to a
+    SEPARATE pipeline (tools/aggregate_sql_tools.py) before any of the
+    single-client logic below runs. is_aggregate_question returning False
+    -- which it does for every ordinary holdings question -- means
+    execution falls straight through to the existing code, unchanged.
     """
     question = question_of(state)
     if not question.strip():
@@ -182,6 +216,20 @@ def sql_agent_node(state: AdvisorState) -> dict:
             "messages": [AIMessage(content="I didn't receive a question about the portfolio.",
                                     name="sql_agent")],
             "sql_result": None,
+            "next_agent": None,
+        }
+
+    if is_aggregate_question(question):
+        try:
+            agg_result = run_aggregate_query_pipeline(question)
+            answer_text = synthesize_aggregate_answer(question, agg_result)
+        except Exception as e:
+            logger.error(f"sql_agent_node (aggregate) failed: {e}", exc_info=True)
+            answer_text = ("I ran into an issue computing that. "
+                            "Could you try rephrasing, or try again shortly?")
+        return {
+            "sql_result": None,
+            "messages": [AIMessage(content=answer_text, name="sql_agent")],
             "next_agent": None,
         }
 

@@ -122,3 +122,24 @@ class SearchResult(BaseModel):
     """Output of the web search agent."""
     summary: str
     sources: list[str]
+
+
+class AggregateQuery(BaseModel):
+    """aggregate_sql_tools.generate_aggregate_query's structured-output
+    contract -- what the LLM returns before validation/execution ever
+    run. Mirrors GeneratedQuery's shape (sql/confidence/needs_clarification
+    /clarification_question) for the cross-client/aggregate pipeline, the
+    same way AggregateQueryResult below mirrors SQLQueryResult."""
+    sql: str
+    confidence: float
+    needs_clarification: bool = False
+    clarification_question: Optional[str] = None
+
+
+class AggregateQueryResult(BaseModel):
+    rows: list[dict] = Field(default_factory=list)
+    row_count: int = 0
+    query_used: Optional[str] = None
+    error: Optional[str] = None
+    needs_clarification: bool = False
+    clarification_question: Optional[str] = None

@@ -36,9 +36,11 @@ Pipeline, mirroring query_rewriter.py's step boundaries:
 6. Repair loop: bounded attempts, stops early on a repeated identical
    error.
 
-Functions here only detect/report/execute. The decision of what to *do*
-with needs_clarification=True belongs to the orchestrator calling
-run_query_pipeline.
+Functions here only detect/report/execute — except for generation-level
+ambiguity (needs_clarification), which is a hard stop: the returned SQL is
+never validated or executed, even though the model still returns a
+best-guess query. The model's own uncertainty is reason enough not to
+touch the database at all.
 """
 
 import concurrent.futures

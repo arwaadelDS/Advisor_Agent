@@ -1,20 +1,32 @@
 """
 Test suite for agents/sql_agent.py
 
-This file only orchestrates: rewrite_question -> (stop if ambiguous) ->
-run_query_pipeline -> synthesize_answer. Every test here mocks those three
-boundaries directly (monkeypatching the names as imported into sql_agent's
-own module namespace) rather than exercising the real DB, LLM, or
-sql_tools pipeline -- those get their own test files.
+Covers: synthesize_answer / synthesize_aggregate_answer (LLM mocked),
+_wants_research_followup (pure regex), run_sql_agent orchestration
+(rewrite_question / run_query_pipeline mocked), and sql_agent_node (the
+LangGraph entrypoint: question_of / is_aggregate_question /
+run_aggregate_query_pipeline / run_sql_agent all mocked at the module
+boundary). No real DB, LLM, or graph execution anywhere in this file.
 
-Assumes this module lives at agents/sql_agent.py (per its own docstring's
-reference to agents/rag_agent.py). Adjust the import below if it's
-actually elsewhere (e.g. tools/sql_agent.py).
+ASSUMPTIONS, both flagged since the real source wasn't available to
+verify against:
+
+1. tools.llm.text_of's real implementation is unknown -- patched here to
+   a simple `lambda resp: resp.content` so these tests verify sql_agent's
+   own orchestration, not text_of's behavior. If text_of does something
+   more involved (e.g. handling multi-block Gemini responses), that
+   deserves its own test file under tools/.
+
+2. schemas.AggregateQueryResult's exact fields weren't available --
+   inferred from tools/aggregate_sql_tools.py's usage (rows, row_count,
+   query_used, error, needs_clarification, clarification_question),
+   mirroring SQLQueryResult's shape.
 """
 
 import pytest
 from schemas import (
     ClientHolding, RewrittenQuery, SQLQueryResult, GeneratedQuery, PipelineResult,
+    AggregateQueryResult,
 )
 from agents import sql_agent as agent
 
@@ -40,6 +52,7 @@ def fake_llm(monkeypatch):
 
     fake = FakeLLM()
     monkeypatch.setattr(agent, "get_llm", lambda: fake)
+    monkeypatch.setattr(agent, "text_of", lambda resp: resp.content)
     return fake
 
 
@@ -79,6 +92,17 @@ def _pipeline_result(question="show holdings for client C001", holdings=None, er
     )
 
 
+def _agg_result(rows=None, error=None, needs_clarification=False, clarification_question=None):
+    return AggregateQueryResult(
+        rows=rows or [],
+        row_count=len(rows) if rows else 0,
+        query_used="SELECT ...",
+        error=error,
+        needs_clarification=needs_clarification,
+        clarification_question=clarification_question,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _format_holdings_for_prompt
 # ---------------------------------------------------------------------------
@@ -96,6 +120,35 @@ def test_format_holdings_nonempty():
     assert "Energy" in text
     assert "100" in text
     assert "5000" in text
+
+
+# ---------------------------------------------------------------------------
+# _wants_research_followup
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("question", [
+    "what's your outlook on this sector",
+    "any research on Saudi Aramco",
+    "what's your opinion on these holdings",
+    "would you recommend rebalancing",
+    "how risky is this portfolio",
+    "give me an analysis of these holdings",
+    "should I be worried about this concentration",
+    "what do you think about this allocation",
+    "your view on Aramco",
+    "what's your perspective here",
+])
+def test_wants_research_followup_matches_research_intent(question):
+    assert agent._wants_research_followup(question) is True
+
+
+@pytest.mark.parametrize("question", [
+    "show holdings for client C001",
+    "what does client C010 hold",
+    "list portfolio holdings for C018",
+])
+def test_wants_research_followup_does_not_match_plain_listing_questions(question):
+    assert agent._wants_research_followup(question) is False
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +178,7 @@ def test_synthesize_answer_error_branch_includes_internal_note_and_instructs_llm
     sql_result = SQLQueryResult(client_id="C001", error="sqlite3.OperationalError: no such column: foo")
     agent.synthesize_answer("show holdings for c001", sql_result)
     system_msg, user_msg = fake_llm.last_messages[0]["content"], fake_llm.last_messages[1]["content"]
-    # the raw error is passed as an internal note for the LLM to reason with...
     assert "sqlite3.OperationalError" in user_msg
-    # ...but both the per-turn instruction and the system prompt tell it
-    # not to repeat that to the advisor
     assert "without repeating raw technical details" in user_msg
     assert "do not expose raw SQL or" in system_msg
 
@@ -151,12 +201,6 @@ def test_synthesize_answer_normal_holdings_branch(fake_llm):
 
 
 def test_synthesize_answer_clarification_takes_priority_over_sql_result(fake_llm):
-    """clarification_question is checked first in synthesize_answer,
-    ahead of sql_result -- so if both are ever passed together, fetched
-    holdings are silently dropped from the prompt. Documenting that
-    precedence explicitly since run_sql_agent's happy path can pass both
-    at once (see test_run_sql_agent_generation_level_clarification_*
-    below)."""
     sql_result = SQLQueryResult(client_id="C001", holdings=[_holding()], row_count=1,
                                  query_used="SELECT ...", error=None)
     agent.synthesize_answer("show holdings for c001", sql_result,
@@ -167,13 +211,47 @@ def test_synthesize_answer_clarification_takes_priority_over_sql_result(fake_llm
 
 
 # ---------------------------------------------------------------------------
-# run_sql_agent — orchestration
+# synthesize_aggregate_answer
+# ---------------------------------------------------------------------------
+
+def test_synthesize_aggregate_answer_clarification_branch(fake_llm):
+    result = _agg_result(needs_clarification=True, clarification_question="biggest by what metric?")
+    agent.synthesize_aggregate_answer("what's the biggest holding", result)
+    user_msg = fake_llm.last_messages[1]["content"]
+    assert "biggest by what metric?" in user_msg
+    assert "ambiguous" in user_msg.lower()
+
+
+def test_synthesize_aggregate_answer_error_branch(fake_llm):
+    result = _agg_result(error="query references disallowed table(s): sqlite_master")
+    agent.synthesize_aggregate_answer("show everything", result)
+    system_msg, user_msg = fake_llm.last_messages[0]["content"], fake_llm.last_messages[1]["content"]
+    assert "sqlite_master" in user_msg
+    assert "without repeating raw technical details" in user_msg
+    assert "do not expose raw SQL or" in system_msg
+
+
+def test_synthesize_aggregate_answer_normal_rows_branch(fake_llm):
+    result = _agg_result(rows=[{"total_value": 1234567.0}])
+    agent.synthesize_aggregate_answer("total portfolio value across all clients", result)
+    user_msg = fake_llm.last_messages[1]["content"]
+    assert "1234567" in user_msg
+
+
+def test_synthesize_aggregate_answer_no_rows_branch(fake_llm):
+    result = _agg_result(rows=[])
+    agent.synthesize_aggregate_answer("total portfolio value", result)
+    user_msg = fake_llm.last_messages[1]["content"]
+    assert "(no rows)" in user_msg
+
+
+# ---------------------------------------------------------------------------
+# run_sql_agent — orchestration (single-client pipeline only; unaffected
+# by the aggregate addition since sql_agent_node decides routing before
+# run_sql_agent is ever called)
 # ---------------------------------------------------------------------------
 
 def test_run_sql_agent_short_circuits_on_ambiguous_rewrite(monkeypatch, fake_llm):
-    """When rewrite_question flags ambiguity, run_query_pipeline must
-    never be called -- no SQL should be generated for a question the
-    rewrite step hasn't resolved yet."""
     rewrite = _rewrite(needs_clarification=True,
                         ambiguous=["'c01' is ambiguous between: C001, C010"])
     monkeypatch.setattr(agent, "rewrite_question", lambda q: rewrite)
@@ -186,7 +264,7 @@ def test_run_sql_agent_short_circuits_on_ambiguous_rewrite(monkeypatch, fake_llm
 
     assert result.needs_clarification is True
     assert result.clarification_question == "'c01' is ambiguous between: C001, C010"
-    assert result.question == "show holdings for c01"          # original, not rewritten
+    assert result.question == "show holdings for c01"
     assert result.rewrite == rewrite
     assert result.generated.sql == ""
     assert result.generated.needs_clarification is True
@@ -212,11 +290,7 @@ def test_run_sql_agent_happy_path_wires_rewrite_and_preserves_original_question(
     original_question = "shwo holdings for c001"
     result = agent.run_sql_agent(original_question)
 
-    # the SQL pipeline only ever sees the rewritten text
     assert captured["question"] == rewrite.rewritten
-
-    # but the original question is preserved on the final result and is
-    # what's handed to the answer LLM, per the module's stated guarantee
     assert result.question == original_question
     user_msg = fake_llm.last_messages[1]["content"]
     assert original_question in user_msg
@@ -257,15 +331,6 @@ def test_run_sql_agent_pipeline_error_still_synthesizes_answer(monkeypatch, fake
 
 
 def test_run_sql_agent_generation_level_clarification_overrides_fetched_holdings(monkeypatch, fake_llm):
-    """rewrite_question isn't the only source of ambiguity: generate_query
-    (inside run_query_pipeline) can independently set needs_clarification
-    -- e.g. the rewritten question still doesn't uniquely identify one
-    client. Confirming the actual behavior here: even when holdings were
-    successfully fetched, synthesize_answer's clarification-first check
-    means those holdings are silently dropped from the final prompt. If
-    that's not the intended product behavior, it's worth deciding now
-    rather than discovering it from a confusing advisor-facing answer
-    later."""
     monkeypatch.setattr(agent, "rewrite_question", lambda q: _rewrite())
 
     pipeline_result = _pipeline_result(
@@ -285,8 +350,6 @@ def test_run_sql_agent_generation_level_clarification_overrides_fetched_holdings
 
 
 def test_query_client_portfolio_tool_delegates_to_run_sql_agent(monkeypatch, fake_llm):
-    """Sanity check on the LangChain @tool wrapper -- it should be a thin
-    pass-through, not reimplement any orchestration logic itself."""
     monkeypatch.setattr(agent, "rewrite_question", lambda q: _rewrite())
     monkeypatch.setattr(agent, "run_query_pipeline", lambda q, **kw: _pipeline_result(holdings=[]))
 
@@ -294,3 +357,97 @@ def test_query_client_portfolio_tool_delegates_to_run_sql_agent(monkeypatch, fak
 
     assert result.question == "show holdings for c001"
     assert result.answer == fake_llm.next_response
+
+
+# ---------------------------------------------------------------------------
+# sql_agent_node — the LangGraph entrypoint: question_of / is_aggregate_question
+# / run_aggregate_query_pipeline / run_sql_agent all mocked at the boundary
+# ---------------------------------------------------------------------------
+
+def test_sql_agent_node_empty_question_returns_apology_without_calling_anything(monkeypatch):
+    monkeypatch.setattr(agent, "question_of", lambda state: "   ")
+
+    def _fail_if_called(*a, **kw):
+        raise AssertionError("nothing downstream should be called for an empty question")
+    monkeypatch.setattr(agent, "is_aggregate_question", _fail_if_called)
+    monkeypatch.setattr(agent, "run_sql_agent", _fail_if_called)
+
+    result = agent.sql_agent_node({"messages": []})
+
+    assert result["sql_result"] is None
+    assert result["next_agent"] is None
+    assert "didn't receive a question" in result["messages"][0].content
+
+
+def test_sql_agent_node_routes_aggregate_questions_to_aggregate_pipeline(monkeypatch, fake_llm):
+    monkeypatch.setattr(agent, "question_of", lambda state: "total portfolio value across all clients")
+    monkeypatch.setattr(agent, "is_aggregate_question", lambda q: True)
+
+    agg_result = _agg_result(rows=[{"total_value": 1000.0}])
+    monkeypatch.setattr(agent, "run_aggregate_query_pipeline", lambda q: agg_result)
+
+    called = {"run_sql_agent": False}
+    def _fail_if_called(*a, **kw):
+        called["run_sql_agent"] = True
+        raise AssertionError("the single-client pipeline should not run for an aggregate question")
+    monkeypatch.setattr(agent, "run_sql_agent", _fail_if_called)
+
+    result = agent.sql_agent_node({"messages": []})
+
+    assert called["run_sql_agent"] is False
+    assert result["sql_result"] is None  # aggregate results aren't stored under sql_result -- confirm intentional
+    assert result["next_agent"] is None
+    assert result["messages"][0].content == fake_llm.next_response
+    assert result["messages"][0].name == "sql_agent"
+
+
+def test_sql_agent_node_aggregate_pipeline_exception_degrades_gracefully(monkeypatch):
+    monkeypatch.setattr(agent, "question_of", lambda state: "total portfolio value")
+    monkeypatch.setattr(agent, "is_aggregate_question", lambda q: True)
+
+    def _raise(*a, **kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(agent, "run_aggregate_query_pipeline", _raise)
+
+    result = agent.sql_agent_node({"messages": []})
+
+    assert result["sql_result"] is None
+    assert result["next_agent"] is None
+    assert "issue computing" in result["messages"][0].content
+
+
+def test_sql_agent_node_single_client_exception_degrades_gracefully(monkeypatch):
+    monkeypatch.setattr(agent, "question_of", lambda state: "show holdings for C001")
+    monkeypatch.setattr(agent, "is_aggregate_question", lambda q: False)
+
+    def _raise(*a, **kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(agent, "run_sql_agent", _raise)
+
+    result = agent.sql_agent_node({"messages": []})
+
+    assert result["sql_result"] is None
+    assert result["next_agent"] is None
+    assert "issue retrieving the portfolio data" in result["messages"][0].content
+
+
+@pytest.mark.parametrize("question,has_holdings,has_error,expected_next_agent", [
+    ("show holdings for C001", True, False, None),                        # plain listing, no research intent
+    ("what's your outlook on these holdings", True, False, "rag_agent"),  # research intent + real holdings
+    ("what's your outlook on these holdings", False, False, None),        # research intent but no holdings
+    ("what's your outlook on these holdings", True, True, None),          # research intent but result errored
+])
+def test_sql_agent_node_research_followup_routing(monkeypatch, question, has_holdings, has_error, expected_next_agent):
+    monkeypatch.setattr(agent, "question_of", lambda state: question)
+    monkeypatch.setattr(agent, "is_aggregate_question", lambda q: False)
+
+    pipeline_result = _pipeline_result(
+        holdings=([_holding()] if has_holdings else []) if not has_error else None,
+        error="some error" if has_error else None,
+    )
+    monkeypatch.setattr(agent, "run_sql_agent", lambda q: pipeline_result)
+
+    result = agent.sql_agent_node({"messages": []})
+
+    assert result["next_agent"] == expected_next_agent
+    assert result["sql_result"] is pipeline_result.result

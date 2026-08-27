@@ -286,10 +286,10 @@ def test_pipeline_happy_path_real_db(fake_llm):
         assert isinstance(h, ClientHolding)
 
 
-def test_pipeline_propagates_needs_clarification_even_on_success(fake_llm):
-    """An ambiguous-but-still-executable query should still run (per
-    design — the caller decides what to do with the flag), but the flag
-    must reach the final PipelineResult."""
+def test_pipeline_never_executes_when_generation_flags_clarification(fake_llm):
+    """An ambiguous generated query must never be executed against the DB
+    -- the model's own uncertainty is reason enough not to touch real data,
+    even read-only. The advisor sees the clarification question either way."""
     fake_llm.responses = [GeneratedQuery(
         sql=GOOD_SQL_C001, confidence=0.4,
         needs_clarification=True,
@@ -299,7 +299,7 @@ def test_pipeline_propagates_needs_clarification_even_on_success(fake_llm):
 
     assert pipeline_result.needs_clarification is True
     assert pipeline_result.clarification_question == "Did you mean client C001 or C010?"
-    assert pipeline_result.result.error is None  # still executed
+    assert pipeline_result.result is None  # never executed
 
 
 def test_pipeline_repairs_validation_error_real_db(fake_llm):
