@@ -14,6 +14,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 import streamlit_app as ui
+from schemas import DocumentChunk, RAGSearchResult
 
 # AppTest resolves a relative path against the *calling* file, which would look
 # for the app inside tests/.
@@ -276,6 +277,54 @@ class TestTheClientPicker:
     def test_the_examples_drop_portfolio_questions_with_no_client(self):
         # Nothing to ask a portfolio question *about*.
         assert not any("hold" in e for e in ui.examples_for(ui.NO_CLIENT))
+
+
+class TestACitationWithNoSourceBehindIt:
+    """Whether to warn is a decision; drawing the warning is Streamlit's job.
+
+    The check itself lives in tools/citations.py. This is about which reply it
+    runs on.
+    """
+
+    def turn_with(self, replies, chunks):
+        turn = a_turn("what are the risks")
+        turn["replies"] = replies
+        turn["rag_context"] = RAGSearchResult(chunks=[
+            DocumentChunk(text=f"extract {i}", source=f"d{i}", score=0.5)
+            for i in range(chunks)
+        ])
+        return turn
+
+    def test_a_citation_past_the_last_source_is_flagged(self):
+        turn = self.turn_with(
+            [{"agent": "rag_agent", "text": "Capex rose [7]."}], chunks=5)
+        assert ui.unsourced_citations(turn) == (7,)
+
+    def test_a_sound_answer_is_not_flagged(self):
+        turn = self.turn_with(
+            [{"agent": "rag_agent", "text": "Margins fell [1]. Capex rose [5]."}],
+            chunks=5)
+        assert ui.unsourced_citations(turn) == ()
+
+    def test_only_the_research_reply_is_checked(self):
+        # The portfolio answer's "[7]" is a row count in prose, not a citation
+        # -- the sources panel is not about it.
+        turn = self.turn_with(
+            [{"agent": "sql_agent", "text": "Seven positions [7]."},
+             {"agent": "rag_agent", "text": "Margins fell [1]."}], chunks=5)
+        assert ui.unsourced_citations(turn) == ()
+
+    def test_a_turn_with_no_research_is_not_flagged(self):
+        turn = a_turn("hello")
+        turn["replies"] = [{"agent": None, "text": "Hello. I can help with [1]."}]
+        assert ui.unsourced_citations(turn) == ()
+
+    def test_a_failed_turn_is_not_flagged(self):
+        # rag_context is None when retrieval died; the apology cites nothing.
+        turn = a_turn("what are the risks")
+        turn["replies"] = [{"agent": "rag_agent",
+                            "text": "I couldn't search the research library."}]
+        assert ui.unsourced_citations(turn) == ()
 
 
 class TestNamingAClientInTheQuestion:

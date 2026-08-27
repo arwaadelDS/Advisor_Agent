@@ -23,6 +23,9 @@ import re
 
 import streamlit as st
 
+# Stdlib underneath, so unlike the graph this is safe to import at module level.
+from tools.citations import check_citations
+
 st.set_page_config(page_title="SNB Capital Advisor Console",
                    page_icon="\N{BANK}", layout="wide")
 
@@ -243,6 +246,29 @@ def render_holdings(sql_result) -> None:
             st.code(sql_result.query_used, language="sql")
 
 
+def research_reply(replies: list[dict]) -> str:
+    """The research answer in this turn, if an agent wrote one.
+
+    Only its prose carries citations. A handoff turn has two replies, and
+    checking the portfolio one as well would only produce false warnings.
+    """
+    for reply in replies:
+        if reply.get("agent") == "rag_agent":
+            return reply.get("text") or ""
+    return ""
+
+
+def unsourced_citations(turn: dict) -> tuple[int, ...]:
+    """Citation numbers in the answer with no source panel behind them.
+
+    ``[7]`` beside five sources reads like any other citation, and the advisor
+    would only find out by opening it. See tools/citations.py.
+    """
+    return check_citations(
+        research_reply(turn["replies"]), turn["rag_context"]
+    ).out_of_range
+
+
 def render_turn(turn: dict) -> None:
     """One question and everything the graph produced answering it."""
     with st.chat_message("user"):
@@ -258,6 +284,15 @@ def render_turn(turn: dict) -> None:
         with st.chat_message("assistant"):
             st.badge(label, color=colour)
             st.markdown(reply["text"])
+
+    unsourced = unsourced_citations(turn)
+    if unsourced:
+        numbers = ", ".join(f"[{n}]" for n in unsourced)
+        st.warning(
+            f"No source below matches {numbers} in the answer above. Treat that "
+            "claim as unsourced.",
+            icon="\N{WARNING SIGN}",
+        )
 
     rag_context = turn["rag_context"]
     sql_result = turn["sql_result"]
