@@ -30,12 +30,13 @@ from functools import lru_cache
 from typing import Any
 
 from langchain_core.messages import AIMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from config import settings
 from ingestion.extract import ARABIC, ENGLISH, classify
 from schemas import RAGSearchResult
 from tools.citations import check_citations
-from tools.llm import text_of
+from tools.llm import Retrying, text_of
 from tools.rag_tools import RagToolError, format_context, search_research
 
 logger = logging.getLogger(__name__)
@@ -149,23 +150,23 @@ def retrieve(state: dict[str, Any], k: int = DEFAULT_K) -> RAGSearchResult:
 
 @lru_cache(maxsize=1)
 def _llm():
-    """The chat model, built once. Imported lazily so retrieval needs no key."""
+    """The chat model, built once. Separate from get_llm for the message below.
+
+    Retrieval needs no key, so the failure worth catching is a key-less run
+    reaching the answering step, and saying which half still works.
+    """
     if not settings.google_api_key:
         raise RagAgentError(
             "GOOGLE_API_KEY is not set, so the agent cannot compose an answer.\n"
             "Retrieval itself needs no key -- try "
             '`uv run python -m tools.rag_tools "your question"`.'
         )
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-    except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise RagAgentError(
-            "langchain-google-genai is not installed. Run `uv sync`."
-        ) from exc
-    return ChatGoogleGenerativeAI(
-        model=settings.llm_model,
-        temperature=settings.llm_temperature,
-        google_api_key=settings.google_api_key,
+    return Retrying(
+        ChatGoogleGenerativeAI(
+            model=settings.llm_model,
+            temperature=settings.llm_temperature,
+            google_api_key=settings.google_api_key,
+        )
     )
 
 
