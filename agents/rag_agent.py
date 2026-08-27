@@ -34,6 +34,7 @@ from langchain_core.messages import AIMessage
 from config import settings
 from ingestion.extract import ARABIC, ENGLISH, classify
 from schemas import RAGSearchResult
+from tools.citations import check_citations
 from tools.llm import text_of
 from tools.rag_tools import RagToolError, format_context, search_research
 
@@ -241,6 +242,14 @@ def rag_node(state: dict[str, Any]) -> dict[str, Any]:
         logger.error("rag_node could not compose an answer: %s", exc, exc_info=True)
         text = ("I found research on this but couldn't summarise it just now. "
                 "The extracts are listed below.")
+
+    # A regex over a string already in memory, so this runs on every answer.
+    # Logged rather than acted on: the rest of the answer and the extracts under
+    # it are still worth showing.
+    report = check_citations(text, result)
+    if not report.ok:
+        logger.error("rag_node answer cites unretrieved extracts: %s",
+                     report.summary())
 
     return {
         "rag_context": result,

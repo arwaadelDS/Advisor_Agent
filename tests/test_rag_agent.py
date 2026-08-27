@@ -369,6 +369,30 @@ class TestTheNodeDegradesInsteadOfRaising:
         assert update["messages"][-1].content
 
 
+class TestTheNodeChecksItsOwnCitations:
+    """The node runs tools/citations.py over every answer, and logs rather than
+    intervenes. The checker itself is tested in tests/test_citations.py.
+    """
+
+    def test_a_citation_past_the_last_extract_is_logged(self, index, monkeypatch, caplog):
+        monkeypatch.setattr(ra, "answer", lambda q, r: "Capex steps up [9].")
+        with caplog.at_level("ERROR"):
+            ra.rag_node(state_for("risks", "2010"))
+        assert "[9]" in caplog.text
+
+    def test_a_sound_answer_logs_nothing(self, index, monkeypatch, caplog):
+        monkeypatch.setattr(ra, "answer", lambda q, r: "Margins fell [1].")
+        with caplog.at_level("ERROR"):
+            ra.rag_node(state_for("risks", "2010"))
+        assert "unretrieved" not in caplog.text
+
+    def test_the_advisor_still_gets_the_answer(self, index, monkeypatch):
+        monkeypatch.setattr(ra, "answer", lambda q, r: "Capex steps up [9].")
+        update = ra.rag_node(state_for("risks", "2010"))
+        assert update["messages"][-1].content == "Capex steps up [9]."
+        assert update["rag_context"].chunks
+
+
 class TestTheModelIsOptional:
     def test_retrieval_needs_no_api_key(self, index, monkeypatch):
         # An ingestion machine with no key must still be able to search.
