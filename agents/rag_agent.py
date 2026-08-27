@@ -166,6 +166,7 @@ def _llm():
             model=settings.llm_model,
             temperature=settings.llm_temperature,
             google_api_key=settings.google_api_key,
+            max_retries=1,  # an attempt count: no SDK retry. See tools/llm.py
         )
     )
 

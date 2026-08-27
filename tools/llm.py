@@ -49,6 +49,11 @@ def get_llm():
             model=os.environ.get("LLM_MODEL", "gemini-2.5-flash"),
             temperature=float(os.environ.get("LLM_TEMPERATURE", 0.2)),
             google_api_key=os.environ["GOOGLE_API_KEY"],
+            # An attempt count, not a retry count: 1 sends the request once and
+            # leaves the SDK's own retry off. Its default of 6 retries 429s
+            # underneath us, spending half a minute on a dead daily quota
+            # before tools/retry.py is even asked.
+            max_retries=1,
         )
     )
 
