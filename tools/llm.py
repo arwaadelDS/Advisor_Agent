@@ -1,18 +1,55 @@
 """The chat model, and the one safe way to read a reply out of it."""
 
 import os
+from functools import lru_cache
 from typing import Any
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from tools.retry import call_with_retry
+
 load_dotenv()
 
+
+class Retrying:
+    """A chat model that retries its own calls. tools/retry.py decides which.
+
+    Wrapped here rather than at each call site, since ``get_llm`` is what the
+    supervisor, both SQL paths, the rewriter and the search agent all call.
+    LangChain's own ``.with_retry()`` cannot sit here: it returns a runnable
+    with no ``with_structured_output``, which two of those callers need.
+    """
+
+    def __init__(self, model):
+        self._model = model
+
+    def invoke(self, *args, **kwargs):
+        return call_with_retry(lambda: self._model.invoke(*args, **kwargs))
+
+    def with_structured_output(self, *args, **kwargs) -> "Retrying":
+        # Wrapped again on the way out, so the retry sits outside the parsing.
+        return Retrying(self._model.with_structured_output(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+
+@lru_cache(maxsize=1)
 def get_llm():
-    return ChatGoogleGenerativeAI(
-        model=os.environ.get("LLM_MODEL", "gemini-2.5-flash"),
-        temperature=float(os.environ.get("LLM_TEMPERATURE", 0.2)),
-        google_api_key=os.environ["GOOGLE_API_KEY"],
+    """The shared chat model, built once.
+
+    Building one costs about 1.6s -- the client sets up three SSL contexts and
+    each loads the system trust store -- and a turn calls this eight times. The
+    model is fixed at first use, so a test that changes the env afterwards needs
+    ``get_llm.cache_clear()``.
+    """
+    return Retrying(
+        ChatGoogleGenerativeAI(
+            model=os.environ.get("LLM_MODEL", "gemini-2.5-flash"),
+            temperature=float(os.environ.get("LLM_TEMPERATURE", 0.2)),
+            google_api_key=os.environ["GOOGLE_API_KEY"],
+        )
     )
 
 
