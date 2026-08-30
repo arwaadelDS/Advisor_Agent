@@ -173,10 +173,15 @@ def _note(
     cover no research for, and no client in context -- and the second would be
     reported as the first. The prompt then turns a corpus-wide search that found
     good research into a refusal.
+
+    The total-non-coverage and partial-non-coverage sentences are kept lexically
+    distinct on purpose (neither opens with the same phrase) -- a shared prefix
+    like "No research covers..." is exactly the kind of surface pattern a model
+    following "if the Note says no research covers the holdings, say that" will
+    match on without checking whether chunks are actually present above it.
     """
     parts: list[str] = []
     if not scoped:
-        # There is no client, so nothing here may talk about one.
         if not found:
             parts.append("Nothing in the index answers this question.")
     elif not covered:
@@ -191,7 +196,10 @@ def _note(
             "it answers this question."
         )
     if uncovered:
-        parts.append(f"No research covers: {', '.join(uncovered)}.")
+        parts.append(
+            f"Research is available for {', '.join(covered) or 'other holdings'}. "
+            f"Separately, no research is indexed for: {', '.join(uncovered)}."
+        )
     if unknown:
         parts.append(
             f"Not in the instrument list, so not searched: {', '.join(unknown)}."

@@ -80,8 +80,8 @@ class TestTickersOf:
 
     def test_it_reads_symbol_off_a_holding(self):
         holding = ClientHolding(
-            symbol="1180", name_en="Al Rajhi Bank", quantity=10,
-            market_value=100, sector="Banking",
+            symbol="1180", name_en="Al Rajhi Bank", name_ar="مصرف الراجحي",
+            quantity=10, market_value=100, sector="Banking", asset_class="Equity",
         )
         assert rt.tickers_of([holding]) == ["1180"]
 
@@ -183,8 +183,8 @@ class TestSearchResearch:
 
     def test_holdings_accepts_the_sql_agents_own_objects(self, index):
         holding = ClientHolding(
-            symbol="2010", name_en="SABIC", quantity=1, market_value=1,
-            sector="Petrochemicals",
+            symbol="2010", name_en="SABIC", name_ar="سابك",
+            quantity=1, market_value=1, sector="Petrochemicals", asset_class="Equity",
         )
         result = rt.search_research("risks", [holding], path=index)
         assert result.searched_tickers == ["2010"]
@@ -296,3 +296,16 @@ class TestFormatContext:
     def test_nothing_at_all_still_says_something(self):
         empty = RAGSearchResult(chunks=[])
         assert rt.format_context(empty).strip()
+
+
+def test_partial_coverage_note_is_lexically_distinct_from_total_non_coverage():
+    """A partial-coverage note must never contain the total-non-coverage phrase,
+    since a shared prefix is what let the model discard real retrieved chunks."""
+    from tools.rag_tools import _note
+
+    partial = _note(covered=["2222"], uncovered=["1180", "2010"],
+                     unknown=[], found=2, scoped=True)
+    total = _note(covered=[], uncovered=[], unknown=[], found=0, scoped=True)
+
+    assert "no research covers" not in partial.lower()
+    assert "no research in the index covers any" in total.lower()

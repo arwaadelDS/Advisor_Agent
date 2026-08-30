@@ -1,275 +1,312 @@
-"""Top-level SQL agent: wires query rewriting into the SQL sub-pipeline,
-composes a final prose answer (mirroring agents/rag_agent.py's pattern of
-"structured data in, cited/grounded prose out"), and exposes both a
-LangGraph node (sql_agent_node) for the Supervisor's graph and a
-standalone @tool entrypoint (query_client_portfolio) for a tool-calling
-caller.
+"""The SQL agent: answer from the client's own data, or ask what's unclear.
 
-Orchestration boundary:
-- tools/query_rewriter.py -> normalizes/corrects the raw question
-- tools/sql_tools.py -> generate/validate/execute/repair sub-pipeline
-  (a cohesive, independently-testable unit; left where it is)
-- this file -> decides the order (rewrite first), decides what happens
-  when rewriting itself surfaces ambiguity (stop before any SQL is
-  generated), composes the final advisor-facing answer, and exposes the
-  node/tool entrypoints other layers call.
+The node graph/state.py declares -- reads client_id and messages off
+AdvisorState, writes sql_result.
 
-Answer synthesis rule, same principle as rag_agent.py: the LLM composing
-the final sentence only ever sees the already-retrieved holdings data (or
-the error/ambiguity state) -- never the raw question alone -- so it can't
-invent figures that aren't in the retrieved rows.
+Two grounding steps run before any SQL is generated, in this order:
+rewrite_query() first (Arabic references resolved against real DB values),
+then run_query_pipeline() (generate -> validate -> execute -> repair). Either
+one can independently decide the question is unanswerable as asked --
+rewrite_query() when a reference in the question matches nothing in the DB,
+run_query_pipeline() when the question itself is ambiguous even after a clean
+rewrite -- and either is checked before the next step runs. There is no point
+generating SQL against a question that still has an unresolved reference in
+it, and no point retrying SQL generation against a question the model itself
+says it cannot answer.
+
+Like rag_node, this degrades instead of raising: a rewrite failure, a
+generation failure, or an answer-synthesis failure all produce an apologetic
+message rather than a traceback, because advisors see this, not logs.
+
+sql_result is written as the raw SQLQueryResult, not the wrapping
+PipelineResult -- that's the exact shape rag_agent.holdings_of() and
+tools.rag_tools.tickers_of() already read off AdvisorState, so the RAG
+handoff needs no changes here; see schemas.py's own docstring on why
+ClientHolding stayed exactly as RAG expects it.
 """
 
+from __future__ import annotations
+
 import logging
-import re
-from schemas import AggregateQueryResult
+from typing import Any
+
 from langchain_core.messages import AIMessage
-from langchain_core.tools import tool
-from pydantic import BaseModel, Field
-from tools.aggregate_sql_tools import is_aggregate_question, run_aggregate_query_pipeline
-from agents.rag_agent import question_of
-from graph.state import AdvisorState
+
+from ingestion.extract import ARABIC, ENGLISH, classify
+from schemas import PipelineResult, SQLQueryResult
 from tools.llm import get_llm, text_of
-from tools.query_rewriter import rewrite_question
-from tools.sql_tools import (
-    run_query_pipeline,
-    DEFAULT_MAX_ROWS,
-    DEFAULT_TIMEOUT_SECONDS,
-    MAX_REPAIR_ATTEMPTS,
-)
-from schemas import PipelineResult, GeneratedQuery, SQLQueryResult, ClientHolding
+from tools.query_rewriter import QueryRewriterError, rewrite_query
+from tools.sql_tools import SQLToolError, run_query_pipeline
 
 logger = logging.getLogger(__name__)
 
+LANGUAGE_NAMES = {ARABIC: "Arabic", ENGLISH: "English"}
 
-ANSWER_SYSTEM_PROMPT = """You are a portfolio assistant for wealth advisors.
+SYSTEM_PROMPT = """\
+You are a data assistant for wealth advisors at SNB Capital.
 
-Answer the advisor's question using ONLY the holdings data given to you below.
-Do not invent figures, tickers, sectors, or holdings that are not listed.
+You answer only from the query result given to you below. It is the only
+source you may use -- you have no other knowledge of this client or these
+figures.
 
 Rules:
-- If the holdings list is empty, say plainly that the client has no matching
-  holdings. That is a correct answer, not a failure.
-- If the data could not be retrieved, explain briefly and professionally that
-  you weren't able to complete the request -- do not expose raw SQL or
-  internal error details to the advisor.
-- If the question was ambiguous, ask the advisor to clarify, briefly and
-  specifically about what's ambiguous.
+- State only what the result contains. Do not add, round, or infer any
+  number that is not directly present in the data.
+- If the result is empty, say plainly that nothing matched, and do not guess
+  why.
+- Be brief and direct -- an advisor is reading this between calls, not a
+  report.
 - Reply in the language of the advisor's question.
-- Be concise -- an advisor is reading this between calls.
 """
-_RESEARCH_INTENT_PATTERN = re.compile(
-    r"\b(outlook|research|opinion|recommend\w*|risk\w*|analysis|should i|"
-    r"think about|view on|perspective)\b", re.IGNORECASE,
-)
 
-def _wants_research_followup(question: str) -> bool:
-    return bool(_RESEARCH_INTENT_PATTERN.search(question))
+USER_PROMPT = """\
+Advisor's question:
+{question}
 
-
-def _format_holdings_for_prompt(holdings: list[ClientHolding]) -> str:
-    if not holdings:
-        return "(no holdings found)"
-    return "\n".join(
-        f"- {h.symbol} ({h.name_en}, {h.sector}): qty {h.quantity}, value {h.market_value}"
-        for h in holdings
-    )
+Query result:
+{result}
+{language}"""
 
 
-def synthesize_answer(question: str, sql_result: SQLQueryResult | None,
-                       clarification_question: str | None = None) -> str:
-    """Composes the final prose answer. Mirrors rag_agent.answer()'s role:
-    structured data/decisions happen upstream; this is the one place that
-    turns them into something an advisor actually reads."""
-    if clarification_question:
-        user_content = (
-            f"The advisor asked: {question}\n\n"
-            f"This question is ambiguous: {clarification_question}\n"
-            f"Ask the advisor to clarify, briefly."
-        )
-    elif sql_result is None or sql_result.error:
-        err = sql_result.error if sql_result else "unknown error"
-        user_content = (
-            f"The advisor asked: {question}\n\n"
-            f"The data could not be retrieved. Internal note: {err}\n"
-            f"Explain briefly and professionally that this couldn't be "
-            f"retrieved, without repeating raw technical details."
-        )
-    else:
-        holdings_text = _format_holdings_for_prompt(sql_result.holdings)
-        user_content = (
-            f"The advisor asked: {question}\n\n"
-            f"Holdings data:\n{holdings_text}\n\n"
-            f"Answer the question using only this data."
-        )
-
-    resp = get_llm().invoke([
-        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ])
-    return text_of(resp)
-
-def synthesize_aggregate_answer(question: str, result: AggregateQueryResult) -> str:
-    if result.clarification_question:
-        user_content = (
-            f"The advisor asked: {question}\n\n"
-            f"This question is ambiguous: {result.clarification_question}\n"
-            f"Ask the advisor to clarify, briefly."
-        )
-    elif result.error:
-        user_content = (
-            f"The advisor asked: {question}\n\n"
-            f"The data could not be retrieved. Internal note: {result.error}\n"
-            f"Explain briefly and professionally that this couldn't be "
-            f"retrieved, without repeating raw technical details."
-        )
-    else:
-        rows_text = "\n".join(str(r) for r in result.rows) or "(no rows)"
-        user_content = (
-            f"The advisor asked: {question}\n\n"
-            f"Query result:\n{rows_text}\n\n"
-            f"Answer the question using only this data."
-        )
-
-    resp = get_llm().invoke([
-        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ])
-    return text_of(resp)
+class SqlAgentError(RuntimeError):
+    """Raised when the agent cannot run -- no question found in state."""
 
 
-def run_sql_agent(question: str,
-                   max_repair_attempts: int = MAX_REPAIR_ATTEMPTS,
-                   timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-                   max_rows: int = DEFAULT_MAX_ROWS) -> PipelineResult:
-    """Full agent entrypoint: rewrite -> (stop here if ambiguous) -> SQL
-    pipeline -> synthesize final answer.
+def question_of(state: dict[str, Any]) -> str:
+    """The advisor's question: the last human turn in messages.
 
-    The original (pre-rewrite) question is always preserved on the
-    returned PipelineResult.question; the RewrittenQuery itself is
-    attached under .rewrite for audit/logging. The SQL pipeline only ever
-    sees the rewritten text; the final .answer is always composed from
-    what was actually retrieved (or the actual error/ambiguity), never
-    from the raw question alone.
+    Same tolerant walk as rag_agent.question_of -- LangChain message objects,
+    dicts, or bare strings -- kept as a separate copy rather than a shared
+    import, since the two agents' state-reading needs are allowed to drift
+    (see agents/sql_agent.py's own node not being a shared graph node).
     """
-    rewrite = rewrite_question(question)
+    messages = state.get("messages") or []
+    for message in reversed(messages):
+        if isinstance(message, str):
+            return message
+        role = getattr(message, "type", None) or (
+            message.get("role") if isinstance(message, dict) else None
+        )
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        if role in ("human", "user") and content:
+            return str(content)
+    if messages:
+        last = messages[-1]
+        content = getattr(last, "content", None)
+        if content is None and isinstance(last, dict):
+            content = last.get("content")
+        return str(content if content is not None else last)
+    return ""
 
-    if rewrite.needs_clarification:
-        clarification_text = "; ".join(rewrite.ambiguous)
-        placeholder_generated = GeneratedQuery(
-            sql="", confidence=0.0, needs_clarification=True,
-            clarification_question=clarification_text,
+
+def language_instruction(question: str) -> str:
+    """A line naming the language to answer in -- same reasoning as
+    rag_agent.language_instruction: naming it outright holds where "reply in
+    the question's language" alone does not, especially once the result data
+    itself is a mix of English column values and Arabic instrument names."""
+    name = LANGUAGE_NAMES.get(classify(question))
+    return f"\nWrite your answer in {name}.\n" if name else ""
+
+
+def format_result(result: SQLQueryResult) -> str:
+    """The structured result as text a model can answer from.
+
+    Kept deliberately plain (no markdown table, no reformatting) -- the model
+    is asked to state only what's here, and a plain list of what's present
+    makes an invented figure easier to catch on review than a table would.
+    """
+    if result.error:
+        return f"The query failed: {result.error}"
+
+    lines: list[str] = []
+    if result.client_profile:
+        p = result.client_profile
+        lines.append(
+            f"Client: {p.name} (id={p.client_id}, risk_profile={p.risk_profile}, aum_tier={p.aum_tier})"
         )
-        answer_text = synthesize_answer(
-            question, None, clarification_question=clarification_text
-        )
-        return PipelineResult(
+    if result.holdings:
+        lines.append(f"Holdings ({len(result.holdings)}):")
+        for h in result.holdings:
+            lines.append(
+                f"- {h.symbol} {h.name_en} / {h.name_ar} | sector={h.sector} "
+                f"asset_class={h.asset_class} qty={h.quantity} value={h.market_value}"
+            )
+    if result.rows:
+        lines.append(f"Rows ({len(result.rows)}):")
+        for row in result.rows:
+            lines.append(f"- {row}")
+    if not lines:
+        lines.append("No rows matched.")
+    return "\n".join(lines)
+
+
+def build_messages(question: str, result: SQLQueryResult) -> list[tuple[str, str]]:
+    """The exact prompt for answer synthesis -- separated from the call so
+    the grounding rules can be tested without a network round trip, same
+    reasoning as rag_agent.build_messages."""
+    return [
+        ("system", SYSTEM_PROMPT),
+        ("user", USER_PROMPT.format(
             question=question,
-            generated=placeholder_generated,
-            rewrite=rewrite,
-            needs_clarification=True,
-            clarification_question=clarification_text,
-            answer=answer_text,
-        )
-
-    result = run_query_pipeline(
-        rewrite.rewritten,
-        max_repair_attempts=max_repair_attempts,
-        timeout_seconds=timeout_seconds,
-        max_rows=max_rows,
-    )
-    result.rewrite = rewrite
-    result.question = question
-    result.answer = synthesize_answer(
-        question, result.result, clarification_question=result.clarification_question
-    )
-    return result
+            result=format_result(result),
+            language=language_instruction(question),
+        )),
+    ]
 
 
-def sql_agent_node(state: AdvisorState) -> dict:
-    """Worker node: answers questions about a client's portfolio holdings.
+def answer(question: str, result: SQLQueryResult) -> str:
+    """Compose a plain-language answer over a structured query result."""
+    return text_of(get_llm().invoke(build_messages(question, result)))
 
-    Reuses agents.rag_agent.question_of for the same message-shape-tolerant
-    extraction rag_node relies on, rather than re-implementing it here --
-    one place decides how "the advisor's question" is pulled out of
-    ``messages``, so the two node files can't drift on that behavior.
 
-    On any failure (LLM error, DB error, etc.) this degrades to a plain
-    apology message rather than letting an exception crash the graph turn
-    -- same resilience pattern as supervisor_node and search_agent_node.
+def sql_agent_node(state: dict[str, Any]) -> dict[str, Any]:
+    """The LangGraph node. Rewrites, queries, answers, updates AdvisorState.
 
-    If the question implies wanting research/opinion on the retrieved
-    holdings (not just the raw numbers), next_agent is set to "rag_agent"
-    so the graph continues into research scoped to exactly those holdings
-    in the same turn, instead of requiring a separate follow-up question.
+    Three points this can stop at, each returning its own apologetic or
+    clarifying message rather than falling through to the next step:
+    rewrite failure, an unresolved reference the rewriter flagged, or a
+    question the SQL pipeline itself could not resolve even after a clean
+    rewrite. Only a clean run past all three reaches answer synthesis.
 
-    Cross-client / computed-figure questions ("total value across all
-    clients", "how many clients are Aggressive risk") are routed to a
-    SEPARATE pipeline (tools/aggregate_sql_tools.py) before any of the
-    single-client logic below runs. is_aggregate_question returning False
-    -- which it does for every ordinary holdings question -- means
-    execution falls straight through to the existing code, unchanged.
+    On success, next_agent is set to "rag_agent" rather than None when the
+    rewriter detected the question also wants research/opinion on the
+    holdings just retrieved (RewrittenQuery.wants_research), and there are
+    actual holdings for RAG to filter by -- an aggregate result has nothing
+    for rag_agent.holdings_of() to search against. See graph/workflow.py's
+    docstring for the sql_agent -> rag_agent edge this relies on.
     """
     question = question_of(state)
-    if not question.strip():
-        return {
-            "messages": [AIMessage(content="I didn't receive a question about the portfolio.",
-                                    name="sql_agent")],
-            "sql_result": None,
-            "next_agent": None,
-        }
+    client_id = state.get("client_id")
 
-    if is_aggregate_question(question):
-        try:
-            agg_result = run_aggregate_query_pipeline(question)
-            answer_text = synthesize_aggregate_answer(question, agg_result)
-        except Exception as e:
-            logger.error(f"sql_agent_node (aggregate) failed: {e}", exc_info=True)
-            answer_text = ("I ran into an issue computing that. "
-                            "Could you try rephrasing, or try again shortly?")
+    if not question.strip():
+        logger.error("sql_node found no advisor question in state['messages']")
         return {
             "sql_result": None,
-            "messages": [AIMessage(content=answer_text, name="sql_agent")],
+            "messages": [AIMessage(
+                content="I didn't catch a question to look up. Could you rephrase?",
+                name="sql_agent",
+            )],
             "next_agent": None,
         }
 
     try:
-        pipeline_result = run_sql_agent(question)
-    except Exception as e:
-        logger.error(f"sql_agent_node failed: {e}", exc_info=True)
+        rewritten = rewrite_query(question, client_selected=bool(client_id))
+    except QueryRewriterError as exc:
+        logger.error("sql_node rewrite failed: %s", exc, exc_info=True)
         return {
+            "sql_result": None,
             "messages": [AIMessage(
-                content="I ran into an issue retrieving the portfolio data. "
-                        "Could you try rephrasing, or try again shortly?",
+                content="I couldn't look up the data just now. Please try again shortly.",
                 name="sql_agent",
             )],
-            "sql_result": None,
             "next_agent": None,
         }
 
-    should_continue_to_rag = (
-        pipeline_result.result is not None
-        and pipeline_result.result.error is None
-        and bool(pipeline_result.result.holdings)
-        and _wants_research_followup(question)
-    )
+    if rewritten.needs_clarification:
+        clarification = (
+            "I couldn't match: " + ", ".join(rewritten.ambiguous)
+            if rewritten.ambiguous else
+            "Could you clarify what you mean?"
+        )
+        return {
+            "sql_result": None,
+            "messages": [AIMessage(content=clarification, name="sql_agent")],
+            "next_agent": None,
+        }
+
+    try:
+        pipeline: PipelineResult = run_query_pipeline(rewritten.rewritten, client_id)
+    except SQLToolError as exc:
+        logger.error("sql_node query pipeline failed: %s", exc, exc_info=True)
+        return {
+            "sql_result": None,
+            "messages": [AIMessage(
+                content="I couldn't run that query just now. Please try again shortly.",
+                name="sql_agent",
+            )],
+            "next_agent": None,
+        }
+
+    if pipeline.needs_clarification:
+        return {
+            "sql_result": None,
+            "messages": [AIMessage(
+                content=pipeline.clarification_question or "Could you clarify what you mean?",
+                name="sql_agent",
+            )],
+            "next_agent": None,
+        }
+
+    if pipeline.validation_error:
+        logger.error("sql_node validation failed after repair budget: %s", pipeline.validation_error)
+        return {
+            "sql_result": None,
+            "messages": [AIMessage(
+                content="I couldn't build a safe query for that. Could you rephrase?",
+                name="sql_agent",
+            )],
+            "next_agent": None,
+        }
+
+    result = pipeline.result
+    if result is None or result.error:
+        logger.error("sql_node execution failed after repair budget: %s",
+                     result.error if result else "no result")
+        return {
+            "sql_result": result,
+            "messages": [AIMessage(
+                content="I found an issue running that query and couldn't recover. "
+                        "Please try rephrasing.",
+                name="sql_agent",
+            )],
+            "next_agent": None,
+        }
+
+    try:
+        text = answer(question, result)
+    except Exception as exc:
+        logger.error("sql_node could not compose an answer: %s", exc, exc_info=True)
+        text = "I retrieved the data but couldn't summarise it just now. Details are below."
+
+    next_agent = "rag_agent" if (rewritten.wants_research and result.holdings) else None
 
     return {
-        "sql_result": pipeline_result.result,
-        "messages": [AIMessage(content=pipeline_result.answer, name="sql_agent")],
-        "next_agent": "rag_agent" if should_continue_to_rag else None,
+        "sql_result": result,
+        "messages": [AIMessage(content=text, name="sql_agent")],
+        "next_agent": next_agent,
     }
 
 
-class QueryClientPortfolioInput(BaseModel):
-    question: str = Field(
-        ..., description="Natural-language question about a client's portfolio holdings"
-    )
+def main(argv: list[str] | None = None) -> int:
+    """Ask the SQL agent a question from the command line.
+
+        uv run python -m agents.sql_agent "average market value by risk profile"
+        uv run python -m agents.sql_agent "this client's holdings" --client C001
+    """
+    import argparse
+    import sys
+
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(prog="agents.sql_agent")
+    parser.add_argument("question")
+    parser.add_argument("--client", default=None, dest="client_id")
+    args = parser.parse_args(argv)
+
+    state: dict[str, Any] = {
+        "messages": [{"role": "user", "content": args.question}],
+        "client_id": args.client_id,
+    }
+    outcome = sql_agent_node(state)
+    for message in outcome["messages"]:
+        print(message.content)
+    if outcome["sql_result"]:
+        print()
+        print(format_result(outcome["sql_result"]))
+    return 0
 
 
-@tool("query_client_portfolio", args_schema=QueryClientPortfolioInput)
-def query_client_portfolio(question: str) -> PipelineResult:
-    """Retrieve a client's portfolio holdings and answer the advisor's
-    question about them in plain language. Use this when the question
-    concerns one specific client's holdings (quantities, values, sectors)."""
-    return run_sql_agent(question)
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -23,11 +23,20 @@ class ClientHolding(BaseModel):
     being reshaped without breaking the document half -- see ``tickers_of`` in
     tools/rag_tools.py.
     """
-    symbol: str
-    name_en: str
-    quantity: int
-    market_value: float
-    sector: str
+    symbol: str        # holdings.ticker
+    name_en: str        
+    name_ar: str       
+    sector: str        
+    asset_class: str    
+    quantity: int        
+    market_value: float 
+
+class ClientProfile(BaseModel):
+    """Client-level facts — one per query, never duplicated onto holdings."""
+    client_id: str
+    name: str
+    risk_profile: str
+    aum_tier: str
 
 
 class RewrittenQuery(BaseModel):
@@ -36,11 +45,28 @@ class RewrittenQuery(BaseModel):
     corrections: list[str] = []
     ambiguous: list[str] = []
     needs_clarification: bool = False
+    wants_research: bool = False
 
 
 class SQLQueryResult(BaseModel):
-    client_id: str
+    """One result shape for both single-client lookups and cross-client
+    aggregates. Which fields get filled depends on what the query asked,
+    not on a separate pipeline -- see tools/sql_tools.py.
+
+    client_profile + holdings: filled when the query resolved to a known
+    client's own data (typed, because rag_agent.holdings_of() and
+    rag_tools.tickers_of() read ClientHolding.symbol off this).
+
+    rows: filled when the query aggregates or spans clients -- GROUP BY,
+    COUNT, cross-client joins -- where the result columns don't match
+    ClientHolding's fixed shape. Raw dicts because an aggregate's columns
+    are whatever that specific query asked for; there is no fixed schema
+    to force them into, and nothing downstream (RAG included) reads rows.
+    """
+    client_id: Optional[str] = None
+    client_profile: Optional[ClientProfile] = None
     holdings: list[ClientHolding] = Field(default_factory=list)
+    rows: list[dict] = Field(default_factory=list)
     row_count: int = 0
     query_used: Optional[str] = None
     error: Optional[str] = None

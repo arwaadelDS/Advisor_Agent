@@ -1,316 +1,463 @@
-"""This module turns a (already rewritten) natural-language question into a
-validated, executed SQL query against the read-only advisor mock DB, and
-returns it in the fixed SQLQueryResult shape the RAG branch expects
-(see schemas.py). This pipeline currently answers exactly one question
-family: "show holdings for client X" — every generated query is a
-5-column projection (symbol, name_en, quantity, market_value, sector)
-joined across clients/holdings/instruments and filtered to one client_id.
-Broader aggregate questions ("total portfolio value", "compare sectors")
-are out of scope for this result shape and are not handled here.
+"""Generation, validation, execution, and repair for the SQL agent.
 
-Pipeline, mirroring query_rewriter.py's step boundaries:
+One generator handles both a single client's data and cross-client
+aggregates -- there is no separate aggregate pipeline. Which of
+SQLQueryResult.holdings / .rows gets filled depends only on whether the
+executed query's columns match ClientHolding's shape; see _shape_rows.
 
-1. Schema grounding: a cached, DB-introspected snapshot of tables/columns
-   is injected into the generation prompt.
+client_profile is never part of the generated SQL. It's a fixed, tiny lookup
+(SELECT * FROM clients WHERE client_id = ...) run deterministically whenever
+client_id is known, so the LLM's only job is ever "answer the question," never
+"also remember to fetch the client's tier." Keeping it out of generation also
+keeps the holdings/rows shape check unambiguous -- a generated query never
+has profile columns mixed into it to confuse that check.
 
-2. Structured-output generation: the LLM returns {sql, confidence,
-   needs_clarification, clarification_question} via a pydantic schema,
-   always targeting the fixed output projection. Ambiguous questions
-   ("which client?") get flagged rather than guessed at — same principle
-   as query_rewriter.py's ambiguous/needs_clarification. When flagged,
-   the returned SQL is NEVER validated or executed, even though the
-   model still returns a best-guess query — the model's own uncertainty
-   is enough reason to not touch the DB at all.
+Validation is a hard gate, not a suggestion: nothing this module executes
+skips validate_sql first. See tools/query_rewriter.py's docstring for why
+that separation matters -- same principle, one step earlier in the pipeline.
 
-3. Validation: sqlglot AST-level checks (single SELECT, only known
-   tables) replace keyword matching. client_id is pulled structurally out
-   of the WHERE clause instead of string-matched from the question text.
+client_id being present in session no longer forces every query to filter on
+it -- an aggregate question ("how many clients...", "total across all
+clients") asked while a client happens to be selected must still be able to
+span all clients. What IS still enforced when no client is selected: an
+unscoped query returning raw, individually-identifiable client rows
+(name/client_id, not truly aggregated -- see _is_aggregated and
+_touches_client_identity) is rejected outright. This closes two real gaps
+found via manual testing: GROUP BY name/client_id still discloses one row per
+client despite the SUM() wrapper, and SELECT * is represented by sqlglot as
+exp.Star rather than exp.Column, so a naive column-name scan misses it
+entirely.
 
-4. Execution: read-only engine, wall-clock timeout, row cap.
-
-5. Row-shape validation: each row is mapped into ClientHolding. A missing
-   expected column is NOT a crash — it's fed back into the repair loop as
-   an actionable error, since that's exactly the KeyError class of bug
-   the eval caught previously.
-
-6. Repair loop: bounded attempts, stops early on a repeated identical
-   error.
-
-Functions here only detect/report/execute — except for generation-level
-ambiguity (needs_clarification), which is a hard stop: the returned SQL is
-never validated or executed, even though the model still returns a
-best-guess query. The model's own uncertainty is reason enough not to
-touch the database at all.
+Statement-type and multi-statement checks are done via sqlglot's parsed AST
+(exp.Select / parse() returning >1 statement) rather than string matching on
+keywords or semicolons -- a regex on raw text is fragile in ways an AST check
+is not (comments, string-literal semicolons, alternate casing/whitespace all
+survive a naive text scan unchanged but not a parse).
 """
 
-import concurrent.futures
+from __future__ import annotations
+
 from functools import lru_cache
+from typing import Optional
 
 import sqlglot
 from sqlglot import exp
 from sqlalchemy import text
 
-from tools.llm import get_llm
 from tools.db import agent_engine
-from schemas import ClientHolding, SQLQueryResult, GeneratedQuery, PipelineResult
+from tools.llm import get_llm
+from schemas import ClientHolding, ClientProfile, GeneratedQuery, PipelineResult, SQLQueryResult
 
-
-ALLOWED_TABLES = {"clients", "instruments", "holdings"}
 DIALECT = "sqlite"
-DEFAULT_MAX_ROWS = 200
-DEFAULT_TIMEOUT_SECONDS = 5
-MAX_REPAIR_ATTEMPTS = 2
+MAX_ROWS = 200
+MAX_REPAIR_ATTEMPTS = 2  # attempts after the first try, not counting it
 
-REQUIRED_COLUMNS = {
-    "symbol": "symbol",
-    "name_en": "name_en",
-    "quantity": "quantity",
-    "market_value": "market_value",
-    "sector": "sector",
+
+class SQLToolError(RuntimeError):
+    """Raised when the pipeline cannot run at all -- no model, no DB connection."""
+
+
+ALLOWED_COLUMNS: dict[str, set[str]] = {
+    "clients": {"client_id", "name", "risk_profile", "aum_tier"},
+    "instruments": {"ticker", "isin", "name_en", "name_ar", "sector", "asset_class", "shariah_flag"},
+    "holdings": {"client_id", "ticker", "quantity", "market_value"},
 }
+ALLOWED_TABLES = set(ALLOWED_COLUMNS)
+
+HOLDING_COLUMNS = {"symbol", "name_en", "name_ar", "sector", "asset_class", "quantity", "market_value"}
+
+CLIENT_FILTER_PATTERN = __import__("re").compile(r":client_id\b")
+
+
+
+SCHEMA_DESCRIPTION = """\
+Tables and columns (SQLite):
+
+clients(client_id, name, risk_profile, aum_tier)
+instruments(ticker, isin, name_en, name_ar, sector, asset_class, shariah_flag)
+holdings(client_id, ticker, quantity, market_value)
+
+holdings.ticker joins to instruments.ticker. holdings.client_id joins to
+clients.client_id. shariah_flag is always empty -- do not filter on it.
+Both holdings and instruments have a "ticker" column -- always qualify it
+(holdings.ticker or instruments.ticker) in any query that joins them.
+"""
+
+SYSTEM_PROMPT = """\
+You write SQLite SELECT queries against a fixed 3-table schema. You never
+generate anything except SELECT statements.
+
+{schema}
+
+Rules:
+- Only SELECT. Never INSERT/UPDATE/DELETE/ALTER/DROP/CREATE/TRUNCATE, and
+  never more than one statement.
+- Only the tables and columns listed above. Do not invent columns.
+- Always include a LIMIT.
+- {client_rule}
+- If a question about one client's positions is being answered, alias the
+  result columns exactly to: ticker AS symbol, name_en, name_ar, sector,
+  asset_class, quantity, market_value -- in that column order. This applies
+  even if the question only asks about one specific instrument or a subset
+  of positions (e.g. "their Almarai position") -- still return the full row
+  shape for the matching holding(s), never just ticker/quantity alone. This
+  lets the caller recognise a holdings-shaped result without guessing.
+- If the question is an aggregate or spans multiple clients (averages,
+  counts, group-bys, "which clients..."), the result columns can be whatever
+  the question needs -- there is no fixed shape to match for those. If no
+  client is selected and the question would otherwise return individual
+  client records (names, client_ids) across all clients with no filter, you
+  must aggregate in a way that does not still expose one row per client --
+  grouping by name or client_id does not count as aggregation for this
+  purpose, since it still discloses each client's exact figure.
+- If the question is ambiguous or unanswerable from this schema, set
+  needs_clarification=true and ask a specific question instead of guessing.
+  - If the question asks for something beyond this schema (e.g. research,
+  opinions, news, risk commentary) in addition to data this schema can
+  answer, do NOT set needs_clarification because of that -- generate SQL
+  for the data-retrievable part only. A separate step handles the
+  non-schema part; your job is only the data half.
+"""
+
+CLIENT_SCOPED_RULE = (
+    "A client (client_id) is selected in this session, but that does not mean "
+    "every question is about that one client. Read the question itself: "
+    "if it refers to 'this client', 'the client', 'their', or similar -- filter "
+    "on holdings.client_id = :client_id (a bind parameter, never a literal ID). "
+    "If the question is about multiple/all clients, an aggregate, or a count "
+    "across clients ('how many clients...', 'total across all clients', "
+    "'average client...') -- do NOT filter by client_id, even though one is "
+    "selected. The session's selected client is available context, not a "
+    "forced scope."
+)
+UNSCOPED_RULE = (
+    "No client is selected in this session. Do not filter by any client_id "
+    "-- this question spans clients or the whole table."
+)
+
+USER_PROMPT = "Question:\n{question}"
 
 
 @lru_cache(maxsize=1)
-def _schema_snapshot() -> str:
-    lines = []
-    with agent_engine.connect() as conn:
-        for table in sorted(ALLOWED_TABLES):
-            cols = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
-            col_desc = ", ".join(f"{c[1]} {c[2]}" for c in cols)
-            lines.append(f"{table}({col_desc})")
-    lines.append("")
-    lines.append("Foreign keys: holdings.client_id -> clients.client_id, "
-                  "holdings.ticker -> instruments.ticker")
-    return "\n".join(lines)
+def _generator_llm():
+    return get_llm().with_structured_output(GeneratedQuery)
 
 
+def generate_query(
+    question: str,
+    client_id: Optional[str] = None,
+    prior_error: Optional[str] = None,
+) -> GeneratedQuery:
+    """Generate one candidate SQL query for the question.
 
-GENERATE_SYSTEM_PROMPT = """You translate a natural-language question about
-a single client's portfolio holdings into a SQLite SELECT query.
+    client_id being set means a client is selected in the session, not that
+    the query must filter on it -- see CLIENT_SCOPED_RULE. The model decides
+    scope from the question's own wording; the validator no longer enforces
+    either direction here, only that an unresolved client_id isn't referenced
+    when none is selected, and that an unscoped query never returns raw
+    individual client records ungrouped. See validate_sql.
 
-Schema:
-{schema}
-
-The query MUST always:
-- SELECT exactly these 5 columns, aliased exactly like this:
-  holdings.ticker AS symbol, instruments.name_en AS name_en,
-  holdings.quantity AS quantity, holdings.market_value AS market_value,
-  instruments.sector AS sector
-- JOIN holdings to clients (on client_id) and to instruments (on ticker)
-- WHERE clients.client_id = '<the client id>'
-
-Rules:
-- If the question doesn't clearly identify one client (no client_id,
-  or a name that could match more than one client), set
-  needs_clarification=true and explain what's ambiguous in
-  clarification_question. Still return your best-guess sql.
-- Set confidence to how sure you are this is the client the user meant.
-- Do not include a LIMIT unless the question asks for a specific count;
-  one will be added automatically.
-"""
-
-REPAIR_SUFFIX = """
-
-The previous attempt failed:
-Previous SQL: {prev_sql}
-Error: {error}
-
-Fix the query so it executes successfully and still follows the required
-column/alias/join shape above.
-"""
-
-
-def generate_query(question: str, prior_error: tuple[str, str] | None = None) -> GeneratedQuery:
-    schema = _schema_snapshot()
-    system_prompt = GENERATE_SYSTEM_PROMPT.format(schema=schema)
-    if prior_error:
-        prev_sql, error = prior_error
-        system_prompt += REPAIR_SUFFIX.format(prev_sql=prev_sql, error=error)
-
-    llm = get_llm().with_structured_output(GeneratedQuery)
-    return llm.invoke([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": question},
-    ])
-
-
-
-def validate_sql(sql: str, max_rows: int = DEFAULT_MAX_ROWS) -> tuple[str | None, str | None]:
-    """Returns (safe_sql, error). Structural checks only:
-    - exactly one statement (blocks stacked-query injection)
-    - statement is a SELECT (DROP/DELETE/UPDATE/INSERT/PRAGMA/ATTACH all
-      parse to a non-Select node type regardless of surrounding text, so
-      no raw keyword-substring pre-filter is needed — that approach
-      false-positives on legitimate literals like WHERE name = 'DROP...')
-    - every referenced table is in ALLOWED_TABLES
-    - LIMIT is injected if missing, capped down if set too high
+    ``prior_error`` is set on repair attempts -- see run_query_pipeline --
+    and is appended to the user turn so the model sees exactly what went
+    wrong last time, not just the original question again.
     """
+    question = question.strip()
+    if not question:
+        raise SQLToolError("a question to generate SQL for cannot be empty")
+
+    client_rule = CLIENT_SCOPED_RULE if client_id else UNSCOPED_RULE
+    system = SYSTEM_PROMPT.format(schema=SCHEMA_DESCRIPTION, client_rule=client_rule)
+    user = USER_PROMPT.format(question=question)
+    if prior_error:
+        user += f"\n\nYour previous attempt failed:\n{prior_error}\nFix it."
+
     try:
-        statements = sqlglot.parse(sql, dialect=DIALECT)
-    except Exception as e:
-        return None, f"SQL failed to parse: {e}"
+        result = _generator_llm().invoke([("system", system), ("user", user)])
+    except Exception as exc:
+        raise SQLToolError(f"SQL generation failed:\n{exc}") from exc
 
-    statements = [s for s in statements if s is not None]
-    if len(statements) != 1:
-        return None, f"expected exactly one statement, found {len(statements)}"
-
-    stmt = statements[0]
-    if not isinstance(stmt, exp.Select):
-        return None, f"only SELECT statements are allowed, got {type(stmt).__name__}"
-
-    tables = {t.name for t in stmt.find_all(exp.Table)}
-    disallowed = tables - ALLOWED_TABLES
-    if disallowed:
-        return None, f"query references disallowed table(s): {', '.join(sorted(disallowed))}"
-
-    existing_limit = stmt.args.get("limit")
-    if existing_limit is None:
-        stmt.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
-    else:
-        try:
-            requested = int(existing_limit.expression.this)
-            if requested > max_rows:
-                stmt.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
-        except (AttributeError, ValueError):
-            stmt.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
-
-    return stmt.sql(dialect=DIALECT), None
+    if not isinstance(result, GeneratedQuery):
+        raise SQLToolError(f"model did not return a GeneratedQuery: {result!r}")
+    return result
 
 
-def _extract_client_id(sql: str) -> str | None:
-    """Pulls the client_id filter value out of the WHERE clause via the
-    AST rather than string-matching the question — structural, not
-    textual, consistent with the rest of this module's validation."""
+
+def _find_ambiguous_columns(parsed, tables: set[str]) -> list[str]:
+    """Unqualified column references that exist in more than one joined
+    table -- SQLite accepts these syntactically and only fails at execution,
+    costing a repair attempt for something checkable statically for free.
+    """
+    if len(tables) < 2:
+        return []
+    ambiguous = []
+    for column in parsed.find_all(exp.Column):
+        if column.table:
+            continue
+        owners = [t for t in tables if column.name.lower() in ALLOWED_COLUMNS.get(t, set())]
+        if len(owners) > 1:
+            ambiguous.append(column.name)
+    return ambiguous
+
+
+def _is_aggregated(parsed) -> bool:
+    """True if the query aggregates *without* grouping by individual client
+    identity. GROUP BY name/client_id still produces one row per client --
+    that's raw per-client disclosure with a SUM() attached, not aggregation
+    that actually hides who's who. A plain aggregate with no GROUP BY
+    (COUNT(*), a single SUM over the whole table) collapses to one summary
+    row and is safe regardless.
+    """
+    if parsed.find(exp.AggFunc) is None:
+        return False
+    group = parsed.args.get("group")
+    if group is not None:
+        group_columns = {c.name.lower() for c in group.find_all(exp.Column)}
+        if group_columns & {"name", "client_id"}:
+            return False
+    return True
+
+
+def _touches_client_identity(parsed, tables: set[str]) -> bool:
+    """True if the query selects columns that identify individual clients
+    (name, client_id) rather than only aggregate/derived values.
+
+    SELECT * is checked explicitly: sqlglot represents a wildcard as
+    exp.Star, not as exp.Column, so a plain find_all(exp.Column) walk is
+    silently blind to "SELECT * FROM clients" -- the single most direct way
+    to ask for everything.
+    """
+    if "clients" not in tables:
+        return False
+    if parsed.find(exp.Star) is not None:
+        return True
+    for column in parsed.find_all(exp.Column):
+        if column.name.lower() in {"name", "client_id"}:
+            return True
+    return False
+
+
+def validate_sql(sql: str, client_id: Optional[str]) -> list[str]:
+    """Policy + syntactic checks. An empty list means the SQL may run.
+
+    client_id present no longer requires a client_id filter -- a client can
+    be selected in session while the question itself is cross-client (an
+    aggregate, a count across clients). Scope is a generation-time decision
+    made from the question's wording (see CLIENT_SCOPED_RULE), not something
+    this validator can safely force. Two things ARE still enforced regardless
+    of whether a client is selected: a query must not reference :client_id at
+    all when no client is in context (that can only be a hallucinated or
+    leftover filter), and a query returning raw, individually-identifiable
+    client rows must be genuinely aggregated -- see _touches_client_identity /
+    _is_aggregated. The second check is keyed on whether the query itself
+    filters by client (``has_client_filter``), not on whether a client
+    happens to be selected in session: CLIENT_SCOPED_RULE explicitly allows a
+    cross-client aggregate to be generated even with a client selected, so
+    gating this guard on ``client_id`` alone left that legitimate branch
+    completely unprotected -- any unscoped, non-aggregated, client-identifying
+    query got a free pass the instant any client had ever been selected in
+    the thread. See tests/test_sql_tools.py for the injection case this closes.
+
+    A non-SELECT statement does not short-circuit the rest of the checks --
+    a DELETE against a non-allowlisted table should still report both
+    problems, not just the first one found.
+    """
+    errors: list[str] = []
+    stripped = sql.strip().rstrip(";")
+
     try:
-        stmt = sqlglot.parse_one(sql, dialect=DIALECT)
-    except Exception:
-        return None
-    for eq in stmt.find_all(exp.EQ):
-        left = eq.this
-        right = eq.expression
-        if isinstance(left, exp.Column) and left.name.lower() == "client_id" \
-                and isinstance(right, exp.Literal):
-            return str(right.this)
-    return None
+        statements = sqlglot.parse(stripped, read=DIALECT)
+    except Exception as exc:
+        errors.append(f"SQL parse error: {exc}")
+        return errors
 
+    non_empty_statements = [s for s in statements if s is not None]
+    if len(non_empty_statements) == 0:
+        errors.append("SQL statement is empty.")
+        return errors
+    if len(non_empty_statements) > 1:
+        errors.append("Multi-statement SQL is not allowed.")
+        return errors
 
-def _execute(sql: str, timeout_seconds: int) -> tuple[list[dict] | None, str | None]:
-    def _run():
-        with agent_engine.connect() as conn:
-            cursor_result = conn.execute(text(sql))
-            columns = list(cursor_result.keys())
-            return [dict(zip(columns, row)) for row in cursor_result.fetchall()]
+    parsed = non_empty_statements[0]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_run)
-        try:
-            return future.result(timeout=timeout_seconds), None
-        except concurrent.futures.TimeoutError:
-            return None, f"query exceeded {timeout_seconds}s timeout"
-        except Exception as e:
-            return None, str(e)
+    if not isinstance(parsed, exp.Select):
+        errors.append(
+            f"Only SELECT statements are allowed (got {type(parsed).__name__})."
+        )
+       
 
+    has_client_filter = bool(CLIENT_FILTER_PATTERN.search(sql))
+    if not client_id and has_client_filter:
+        errors.append("No client is in context; the query must not reference :client_id.")
 
+    tables = {t.name.lower() for t in parsed.find_all(exp.Table)}
+    unknown_tables = tables - ALLOWED_TABLES
+    if unknown_tables:
+        errors.append(f"References non-allowlisted tables: {sorted(unknown_tables)}")
 
-def _map_rows(rows: list[dict]) -> tuple[list[ClientHolding] | None, str | None]:
-    """Maps raw result rows into ClientHolding. A missing expected column
-    is reported as an error string (repair-loop fodder), never raised as
-    a bare KeyError."""
-    if not rows:
-        return [], None
+    allowed_used_tables = tables & ALLOWED_TABLES
 
-    missing = set(REQUIRED_COLUMNS) - set(rows[0].keys())
-    if missing:
-        return None, (f"query result is missing required column(s): "
-                       f"{', '.join(sorted(missing))} — got columns: "
-                       f"{', '.join(rows[0].keys())}")
+    ambiguous_cols = _find_ambiguous_columns(parsed, allowed_used_tables)
+    if ambiguous_cols:
+        errors.append(f"Ambiguous unqualified columns (qualify with table name): {sorted(set(ambiguous_cols))}")
 
-    holdings = []
-    for row in rows:
-        try:
-            holdings.append(ClientHolding(
-                symbol=row["symbol"],
-                name_en=row["name_en"],
-                quantity=row["quantity"],
-                market_value=row["market_value"],
-                sector=row["sector"],
-            ))
-        except Exception as e:
-            return None, f"row failed to map to ClientHolding: {e}"
-    return holdings, None
-
-
-def run_query_pipeline(question: str, max_repair_attempts: int = MAX_REPAIR_ATTEMPTS,
-                        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-                        max_rows: int = DEFAULT_MAX_ROWS) -> PipelineResult:
-    generated = generate_query(question)
-    if generated.needs_clarification:
-        return PipelineResult(
-            question=question, generated=generated,
-            needs_clarification=True,
-            clarification_question=generated.clarification_question,
+    if not has_client_filter and _touches_client_identity(parsed, allowed_used_tables) and not _is_aggregated(parsed):
+        errors.append(
+            "A query returning individual client records must be aggregated "
+            "in a way that does not still disclose one row per client "
+            "(grouping by name/client_id does not count) -- raw or per-client "
+            "rows across clients are not allowed without a client filter, "
+            "regardless of whether a client happens to be selected in session."
         )
 
-    last_error: str | None = None
+    for column in parsed.find_all(exp.Column):
+        table_name = column.table.lower() if column.table else None
+        if table_name and table_name in ALLOWED_COLUMNS:
+            if column.name.lower() not in ALLOWED_COLUMNS[table_name]:
+                errors.append(f"Unknown column {table_name}.{column.name}")
+
+    if isinstance(parsed, exp.Select) and parsed.args.get("limit") is None:
+        errors.append("A LIMIT is required.")
+
+    return errors
+
+def fetch_client_profile(client_id: str) -> Optional[ClientProfile]:
+    """The deterministic client-facts lookup. Never touches generated SQL."""
+    try:
+        with agent_engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT client_id, name, risk_profile, aum_tier FROM clients WHERE client_id = :client_id"),
+                {"client_id": client_id},
+            ).fetchone()
+    except Exception as exc:
+        raise SQLToolError(f"client profile lookup failed:\n{exc}") from exc
+
+    if row is None:
+        return None
+    return ClientProfile(client_id=row[0], name=row[1], risk_profile=row[2], aum_tier=row[3])
+
+
+def _shape_rows(columns: list[str], rows: list[tuple]) -> tuple[list[ClientHolding], list[dict]]:
+    """Split a raw result into (holdings, rows) by column shape.
+
+    Exact match against HOLDING_COLUMNS, in any order, is what makes this a
+    holdings result -- the generation prompt asks for that exact alias set
+    when the question is client-scoped, so this is checking that the model
+    followed the convention, not guessing at intent.
+    """
+    if set(columns) == HOLDING_COLUMNS:
+        holdings = [ClientHolding(**dict(zip(columns, row))) for row in rows]
+        return holdings, []
+    return [], [dict(zip(columns, row)) for row in rows]
+
+
+def execute_sql(sql: str, client_id: Optional[str]) -> SQLQueryResult:
+    """Run already-validated SQL. Never call this on unvalidated SQL."""
+    params = {"client_id": client_id} if client_id else {}
+    try:
+        with agent_engine.connect() as conn:
+            result = conn.execute(text(sql), params)
+            rows = result.fetchmany(MAX_ROWS)
+            columns = list(result.keys())
+    except Exception as exc:
+        return SQLQueryResult(client_id=client_id, error=str(exc))
+
+    holdings, generic_rows = _shape_rows(columns, rows)
+    return SQLQueryResult(
+        client_id=client_id,
+        holdings=holdings,
+        rows=generic_rows,
+        row_count=len(rows),
+        query_used=sql,
+    )
+
+
+
+def run_query_pipeline(question: str, client_id: Optional[str] = None) -> PipelineResult:
+    """Generate -> validate -> execute, retrying on either failure.
+
+    A validation failure and an execution failure are both fed back to
+    generate_query as prior_error and count against the same repair budget --
+    the model doesn't need to know which kind of failure it was to fix it,
+    just what the error said.
+    """
     attempts = 0
+    generated = generate_query(question, client_id)
 
     while True:
-        safe_sql, validation_error = validate_sql(generated.sql, max_rows=max_rows)
+        if generated.needs_clarification:
+            return PipelineResult(
+                question=question,
+                generated=generated,
+                repair_attempts=attempts,
+                needs_clarification=True,
+                clarification_question=generated.clarification_question,
+            )
 
-        if validation_error:
-            if attempts >= max_repair_attempts:
-                result = SQLQueryResult(
-                    client_id=_extract_client_id(generated.sql) or "",
-                    query_used=generated.sql,
-                    error=validation_error,
-                )
+        errors = validate_sql(generated.sql, client_id)
+        if errors:
+            validation_error = "; ".join(errors)
+            if attempts >= MAX_REPAIR_ATTEMPTS:
                 return PipelineResult(
-                    question=question, generated=generated, result=result,
-                    validation_error=validation_error, repair_attempts=attempts,
-                    needs_clarification=generated.needs_clarification,
-                    clarification_question=generated.clarification_question,
+                    question=question,
+                    generated=generated,
+                    validation_error=validation_error,
+                    repair_attempts=attempts,
                 )
             attempts += 1
-            generated = generate_query(question, prior_error=(generated.sql, validation_error))
+            generated = generate_query(question, client_id, prior_error=validation_error)
             continue
 
-        rows, exec_error = _execute(safe_sql, timeout_seconds)
-        step_error = exec_error
+        result = execute_sql(generated.sql, client_id)
+        if result.error and attempts < MAX_REPAIR_ATTEMPTS:
+            attempts += 1
+            generated = generate_query(question, client_id, prior_error=result.error)
+            continue
 
-        holdings = None
-        if step_error is None:
-            holdings, map_error = _map_rows(rows)
-            step_error = map_error
+        if client_id and not result.error and CLIENT_FILTER_PATTERN.search(generated.sql):
+            profile = fetch_client_profile(client_id)
+            result = result.model_copy(update={"client_profile": profile})
 
-        if step_error is None:
-            client_id = _extract_client_id(safe_sql) or ""
-            result = SQLQueryResult(
-                client_id=client_id,
-                holdings=holdings,
-                row_count=len(holdings),
-                query_used=safe_sql,
-                error=None,
-            )
-            return PipelineResult(
-                question=question, generated=generated, result=result,
-                repair_attempts=attempts,
-                needs_clarification=generated.needs_clarification,
-                clarification_question=generated.clarification_question,
-            )
+        return PipelineResult(question=question, generated=generated, result=result, repair_attempts=attempts)
 
-        if attempts >= max_repair_attempts or step_error == last_error:
-            result = SQLQueryResult(
-                client_id=_extract_client_id(safe_sql) or "",
-                query_used=safe_sql,
-                error=step_error,
-            )
-            return PipelineResult(
-                question=question, generated=generated, result=result,
-                repair_attempts=attempts,
-                needs_clarification=generated.needs_clarification,
-                clarification_question=generated.clarification_question,
-            )
 
-        last_error = step_error
-        attempts += 1
-        generated = generate_query(question, prior_error=(safe_sql, step_error))
+def main(argv: list[str] | None = None) -> int:
+    """Run the pipeline from the command line.
+
+        uv run python -m tools.sql_tools "average market value by risk profile"
+        uv run python -m tools.sql_tools "this client's holdings" --client C001
+    """
+    import argparse
+    import sys
+
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(prog="tools.sql_tools")
+    parser.add_argument("question")
+    parser.add_argument("--client", default=None, dest="client_id")
+    args = parser.parse_args(argv)
+
+    outcome = run_query_pipeline(args.question, args.client_id)
+    print(f"SQL: {outcome.generated.sql}")
+    print(f"repair_attempts: {outcome.repair_attempts}")
+    if outcome.needs_clarification:
+        print(f"needs_clarification: {outcome.clarification_question}")
+        return 0
+    if outcome.validation_error:
+        print(f"validation_error: {outcome.validation_error}")
+        return 1
+    if outcome.result and outcome.result.error:
+        print(f"execution error: {outcome.result.error}")
+        return 1
+    if outcome.result:
+        if outcome.result.client_profile:
+            print(f"profile: {outcome.result.client_profile}")
+        for h in outcome.result.holdings:
+            print(f"  {h.symbol}  {h.name_en}  qty={h.quantity}  value={h.market_value}")
+        for r in outcome.result.rows:
+            print(f"  {r}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,393 +1,537 @@
-"""
-Test suite for tools/sql_tools.py
+"""Unit tests for tools/sql_tools.py.
 
-Same three-tier structure as test_query_rewriter.py:
-
-1. PURE UNIT — validate_sql, _extract_client_id, _map_rows need no DB or
-   LLM at all. These run fast and pin down the exact regression cases
-   already found by hand (the 'DROP the ball' literal false-positive,
-   stacked-statement injection, the KeyError-class row-mapping bug).
-
-2. GENERATION — generate_query / repair-loop behavior, using a fake LLM
-   fixture that returns a queued sequence of GeneratedQuery responses, so
-   multi-attempt repair-loop paths can be scripted deterministically.
-
-3. INTEGRATION — run_query_pipeline against the real read-only DB via
-   tools.db.agent_engine, with the LLM still faked (so tests are
-   deterministic) but execution, row-mapping, and client_id extraction
-   are real. Requires a live, seeded DB (same mock data as
-   test_query_rewriter.py: clients C001-C018).
+Each layer is tested against its own boundary: validate_sql and _shape_rows
+need no mocking at all (pure functions); generate_query mocks _generator_llm;
+execute_sql/fetch_client_profile mock agent_engine; run_query_pipeline mocks
+generate_query/validate_sql/execute_sql/fetch_client_profile directly, since
+its own contract is "wire these four together with a repair budget," not
+"re-verify what each of them does alone."
 """
 
 import pytest
+
+from schemas import ClientHolding, ClientProfile, GeneratedQuery, PipelineResult, SQLQueryResult
 from tools import sql_tools as st
-from schemas import GeneratedQuery, ClientHolding
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# validate_sql
 # ---------------------------------------------------------------------------
 
-class _FakeStructuredLLM:
-    """Returned by FakeLLM.with_structured_output(...). Pops the next
-    queued response each call so repair-loop sequences can be scripted;
-    repeats the last response if the queue runs out."""
+class TestValidateSql:
+    def test_valid_client_scoped_query_passes(self):
+        sql = "SELECT holdings.ticker AS symbol, name_en, name_ar, sector, asset_class, quantity, market_value " \
+              "FROM holdings JOIN instruments ON holdings.ticker = instruments.ticker " \
+              "WHERE holdings.client_id = :client_id LIMIT 50"
+        assert st.validate_sql(sql, client_id="C001") == []
 
-    def __init__(self, outer):
-        self._outer = outer
+    def test_valid_unscoped_aggregate_passes(self):
+        sql = "SELECT risk_profile, AVG(market_value) FROM clients " \
+              "JOIN holdings ON clients.client_id = holdings.client_id " \
+              "GROUP BY risk_profile LIMIT 10"
+        assert st.validate_sql(sql, client_id=None) == []
 
-    def invoke(self, messages):
-        self._outer.last_messages = messages
-        self._outer.call_count += 1
-        if self._outer.responses:
-            self._outer.last_response = self._outer.responses.pop(0)
-        return self._outer.last_response
+    def test_aggregate_query_with_client_selected_but_not_filtered_passes(self):
+        """The core fix: a client_id in session no longer forces a filter --
+        an aggregate question asked while a client happens to be selected
+        must be allowed to legitimately span all clients."""
+        sql = "SELECT COUNT(*) FROM clients WHERE risk_profile = 'Aggressive' LIMIT 10"
+        assert st.validate_sql(sql, client_id="C001") == []
 
+    def test_client_scoped_query_with_filter_still_passes(self):
+        """The other legitimate reading with a client selected -- filtering
+        is still allowed, just no longer required."""
+        sql = "SELECT * FROM holdings WHERE client_id = :client_id LIMIT 10"
+        assert st.validate_sql(sql, client_id="C001") == []
+
+    def test_unscoped_query_with_client_filter_rejected(self):
+        errors = st.validate_sql(
+            "SELECT * FROM holdings WHERE client_id = :client_id LIMIT 10", client_id=None
+        )
+        assert any("must not reference :client_id" in e for e in errors)
+
+    def test_non_select_rejected(self):
+        errors = st.validate_sql("DELETE FROM holdings LIMIT 1", client_id=None)
+        assert any("Only SELECT" in e for e in errors)
+
+    def test_multi_statement_rejected(self):
+        errors = st.validate_sql("SELECT * FROM clients LIMIT 1; DROP TABLE clients", client_id=None)
+        assert any("Multi-statement" in e for e in errors)
+
+    def test_non_allowlisted_table_rejected(self):
+        errors = st.validate_sql("SELECT * FROM secret_table LIMIT 10", client_id=None)
+        assert any("non-allowlisted tables" in e for e in errors)
+
+    def test_missing_limit_rejected(self):
+        errors = st.validate_sql("SELECT * FROM clients", client_id=None)
+        assert any("LIMIT is required" in e for e in errors)
+
+    def test_unparseable_sql_rejected(self):
+        errors = st.validate_sql("SELEKT nonsense FROM (((", client_id=None)
+        assert any("parse error" in e for e in errors)
+
+    def test_unknown_qualified_column_rejected(self):
+        errors = st.validate_sql("SELECT clients.ssn FROM clients LIMIT 10", client_id=None)
+        assert any("Unknown column clients.ssn" in e for e in errors)
+
+    def test_ambiguous_unqualified_column_in_join_rejected(self):
+        """The exact bug the integration test hit: 'ticker' exists on both
+        joined tables and is left unqualified."""
+        sql = "SELECT ticker, name_en FROM holdings JOIN instruments " \
+              "ON holdings.ticker = instruments.ticker LIMIT 10"
+        errors = st.validate_sql(sql, client_id=None)
+        assert any("Ambiguous unqualified columns" in e for e in errors)
+        assert any("ticker" in e for e in errors)
+
+    def test_qualified_column_in_join_not_flagged_ambiguous(self):
+        sql = "SELECT holdings.ticker, name_en FROM holdings JOIN instruments " \
+              "ON holdings.ticker = instruments.ticker LIMIT 10"
+        errors = st.validate_sql(sql, client_id=None)
+        assert not any("Ambiguous" in e for e in errors)
+
+    def test_single_table_query_never_flagged_ambiguous(self):
+        """Only relevant once two+ tables are joined -- a single-table query
+        can't have a genuinely ambiguous column."""
+        errors = st.validate_sql("SELECT ticker FROM instruments LIMIT 10", client_id=None)
+        assert not any("Ambiguous" in e for e in errors)
+
+    def test_multiple_errors_all_reported(self):
+        errors = st.validate_sql("DELETE FROM secret_table", client_id=None)
+        assert len(errors) >= 2
+
+    def test_group_by_client_identity_still_rejected(self):
+        """Regression: GROUP BY name still discloses per-client data, a
+        SUM() wrapper does not make it safe."""
+        sql = "SELECT name, SUM(market_value) AS total FROM clients " \
+              "JOIN holdings ON clients.client_id = holdings.client_id " \
+              "GROUP BY name LIMIT 100"
+        errors = st.validate_sql(sql, client_id=None)
+        assert any("must be aggregated" in e for e in errors)
+
+    def test_select_star_on_clients_rejected_unscoped(self):
+        """Regression: SELECT * bypassed detection entirely -- sqlglot
+        represents it as exp.Star, not exp.Column."""
+        errors = st.validate_sql("SELECT * FROM clients LIMIT 100", client_id=None)
+        assert any("must be aggregated" in e for e in errors)
+
+    def test_group_by_sector_not_client_identity_still_passes(self):
+        """Confirms the fix isn't overbroad: grouping by a non-identity
+        column is still legitimate aggregation."""
+        sql = "SELECT risk_profile, AVG(market_value) FROM clients " \
+              "JOIN holdings ON clients.client_id = holdings.client_id " \
+              "GROUP BY risk_profile LIMIT 10"
+        assert st.validate_sql(sql, client_id=None) == []
+
+    def test_ddl_via_alternate_casing_still_rejected(self):
+        """Regression: the old check was regex-on-raw-text; this confirms
+        detection now survives things a naive text scan could miss."""
+        errors = st.validate_sql("dRoP table clients", client_id=None)
+        assert any("Only SELECT" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# _shape_rows
+# ---------------------------------------------------------------------------
+
+class TestShapeRows:
+    def test_holding_shaped_columns_become_client_holdings(self):
+        columns = ["symbol", "name_en", "name_ar", "sector", "asset_class", "quantity", "market_value"]
+        rows = [("2010", "SABIC", "سابك", "Petrochemicals", "Equity", 1000, 45000.0)]
+
+        holdings, generic_rows = st._shape_rows(columns, rows)
+
+        assert generic_rows == []
+        assert len(holdings) == 1
+        assert isinstance(holdings[0], ClientHolding)
+        assert holdings[0].symbol == "2010"
+        assert holdings[0].market_value == 45000.0
+
+    def test_holding_shaped_columns_in_different_order_still_match(self):
+        columns = ["market_value", "symbol", "quantity", "name_en", "sector", "asset_class", "name_ar"]
+        rows = [(45000.0, "2010", 1000, "SABIC", "Petrochemicals", "Equity", "سابك")]
+
+        holdings, generic_rows = st._shape_rows(columns, rows)
+
+        assert generic_rows == []
+        assert holdings[0].symbol == "2010"
+
+    def test_non_holding_shape_becomes_generic_rows(self):
+        columns = ["risk_profile", "AVG(market_value)"]
+        rows = [("Aggressive", 52000.0), ("Conservative", 31000.0)]
+
+        holdings, generic_rows = st._shape_rows(columns, rows)
+
+        assert holdings == []
+        assert generic_rows == [
+            {"risk_profile": "Aggressive", "AVG(market_value)": 52000.0},
+            {"risk_profile": "Conservative", "AVG(market_value)": 31000.0},
+        ]
+
+    def test_empty_rows_returns_empty_generic(self):
+        holdings, generic_rows = st._shape_rows(["risk_profile"], [])
+        assert holdings == []
+        assert generic_rows == []
+
+
+# ---------------------------------------------------------------------------
+# generate_query
+# ---------------------------------------------------------------------------
 
 class FakeLLM:
-    def __init__(self):
-        self.responses: list[GeneratedQuery] = []
-        self.last_response: GeneratedQuery | None = None
-        self.last_messages = None
-        self.call_count = 0
+    def __init__(self, response):
+        self._response = response
 
-    def with_structured_output(self, schema):
-        assert schema is GeneratedQuery
-        return _FakeStructuredLLM(self)
+    def invoke(self, messages):
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
 
 
-@pytest.fixture
-def fake_llm(monkeypatch):
-    fake = FakeLLM()
-    monkeypatch.setattr(st, "get_llm", lambda: fake)
-    return fake
+@pytest.fixture(autouse=True)
+def clear_llm_cache():
+    st._generator_llm.cache_clear()
+    yield
+    st._generator_llm.cache_clear()
 
 
-# A known-good query matching the fixed required projection, for a real
-# seeded client. Assumes C001 exists (mock generator always creates
-# C001-C018) and has at least one holding — if C001 happens to have zero
-# holdings for a given seed, swap to another C0xx.
-GOOD_SQL_C001 = (
-    "SELECT holdings.ticker AS symbol, instruments.name_en AS name_en, "
-    "holdings.quantity AS quantity, holdings.market_value AS market_value, "
-    "instruments.sector AS sector "
-    "FROM holdings "
-    "JOIN clients ON holdings.client_id = clients.client_id "
-    "JOIN instruments ON holdings.ticker = instruments.ticker "
-    "WHERE clients.client_id = 'C001'"
-)
+def _patch_generator_llm(monkeypatch, response):
+    monkeypatch.setattr(st, "_generator_llm", lambda: FakeLLM(response))
 
 
-# ---------------------------------------------------------------------------
-# 1. PURE UNIT — validate_sql
-# ---------------------------------------------------------------------------
+class TestGenerateQuery:
+    def test_empty_question_raises(self):
+        with pytest.raises(st.SQLToolError, match="cannot be empty"):
+            st.generate_query("   ")
 
-def test_validate_sql_accepts_clean_select():
-    safe_sql, error = st.validate_sql("SELECT * FROM clients")
-    assert error is None
-    assert "LIMIT 200" in safe_sql
+    def test_successful_generation_returns_generated_query(self, monkeypatch):
+        fake = GeneratedQuery(sql="SELECT * FROM clients LIMIT 10", confidence=0.9)
+        _patch_generator_llm(monkeypatch, fake)
 
+        result = st.generate_query("list all clients")
 
-def test_validate_sql_injects_limit_when_missing():
-    safe_sql, error = st.validate_sql("SELECT * FROM clients", max_rows=50)
-    assert error is None
-    assert "LIMIT 50" in safe_sql
+        assert result.sql == "SELECT * FROM clients LIMIT 10"
 
+    def test_non_generated_query_return_raises(self, monkeypatch):
+        _patch_generator_llm(monkeypatch, "not a GeneratedQuery")
+        with pytest.raises(st.SQLToolError, match="did not return a GeneratedQuery"):
+            st.generate_query("some question")
 
-def test_validate_sql_clamps_oversized_limit():
-    safe_sql, error = st.validate_sql("SELECT * FROM clients LIMIT 5000", max_rows=200)
-    assert error is None
-    assert "LIMIT 200" in safe_sql
-    assert "5000" not in safe_sql
-
-
-def test_validate_sql_keeps_limit_under_cap():
-    safe_sql, error = st.validate_sql("SELECT * FROM clients LIMIT 10", max_rows=200)
-    assert error is None
-    assert "LIMIT 10" in safe_sql
-
-
-def test_validate_sql_rejects_stacked_statements():
-    """Regression: multi-statement injection via `; DROP TABLE ...`"""
-    safe_sql, error = st.validate_sql("SELECT * FROM clients; DROP TABLE clients;")
-    assert safe_sql is None
-    assert "one statement" in error
-
-
-@pytest.mark.parametrize("sql", [
-    "DROP TABLE clients",
-    "DELETE FROM clients",
-    "UPDATE clients SET name = 'x'",
-    "INSERT INTO clients VALUES (1,2,3,4)",
-    "PRAGMA table_info(clients)",
-    "ATTACH DATABASE '/etc/passwd' AS x",
-])
-def test_validate_sql_rejects_non_select_statements(sql):
-    safe_sql, error = st.validate_sql(sql)
-    assert safe_sql is None
-    assert "SELECT" in error
-
-
-def test_validate_sql_rejects_disallowed_table():
-    safe_sql, error = st.validate_sql("SELECT * FROM secrets")
-    assert safe_sql is None
-    assert "secrets" in error
-
-
-def test_validate_sql_regression_no_false_positive_on_keyword_in_literal():
-    """Regression: a raw keyword-substring pre-filter would reject this
-    on the word 'DROP' appearing inside a string literal, not SQL syntax.
-    validate_sql must accept it since it's a structurally clean SELECT."""
-    sql = "SELECT * FROM clients WHERE name = 'DROP the ball'"
-    safe_sql, error = st.validate_sql(sql)
-    assert error is None
-    assert "DROP the ball" in safe_sql
-
-
-def test_validate_sql_regression_no_false_positive_on_insert_in_literal():
-    sql = "SELECT * FROM clients WHERE name = 'Insert Coin Al-Otaibi'"
-    safe_sql, error = st.validate_sql(sql)
-    assert error is None
-
-
-def test_validate_sql_rejects_malformed_sql():
-    safe_sql, error = st.validate_sql("SELECT FROM WHERE ***")
-    assert safe_sql is None
-    assert error is not None
+    def test_llm_exception_wrapped(self, monkeypatch):
+        _patch_generator_llm(monkeypatch, RuntimeError("quota exceeded"))
+        with pytest.raises(st.SQLToolError, match="SQL generation failed"):
+            st.generate_query("some question")
 
 
 # ---------------------------------------------------------------------------
-# 1. PURE UNIT — _extract_client_id
+# execute_sql / fetch_client_profile
 # ---------------------------------------------------------------------------
 
-def test_extract_client_id_simple_equality():
-    sql = "SELECT * FROM clients WHERE clients.client_id = 'C007'"
-    assert st._extract_client_id(sql) == "C007"
+class FakeResult:
+    def __init__(self, columns, rows):
+        self._columns = columns
+        self._rows = rows
+
+    def fetchmany(self, n):
+        return self._rows[:n]
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def keys(self):
+        return self._columns
 
 
-def test_extract_client_id_unqualified_column():
-    sql = "SELECT * FROM clients WHERE client_id = 'C012'"
-    assert st._extract_client_id(sql) == "C012"
+class FakeConnection:
+    def __init__(self, columns=None, rows=None, raise_on_execute=None):
+        self._columns = columns or []
+        self._rows = rows or []
+        self._raise_on_execute = raise_on_execute
+
+    def execute(self, stmt, params=None):
+        if self._raise_on_execute:
+            raise self._raise_on_execute
+        return FakeResult(self._columns, self._rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
-def test_extract_client_id_from_full_join_query():
-    assert st._extract_client_id(GOOD_SQL_C001) == "C001"
+class FakeEngine:
+    def __init__(self, connection=None, raise_on_connect=None):
+        self._connection = connection
+        self._raise_on_connect = raise_on_connect
+
+    def connect(self):
+        if self._raise_on_connect:
+            raise self._raise_on_connect
+        return self._connection
 
 
-def test_extract_client_id_returns_none_when_absent():
-    sql = "SELECT * FROM clients WHERE risk_profile = 'Aggressive'"
-    assert st._extract_client_id(sql) is None
+class TestExecuteSql:
+    def test_holdings_shaped_success(self, monkeypatch):
+        columns = ["symbol", "name_en", "name_ar", "sector", "asset_class", "quantity", "market_value"]
+        rows = [("2010", "SABIC", "سابك", "Petrochemicals", "Equity", 1000, 45000.0)]
+        monkeypatch.setattr(st, "agent_engine", FakeEngine(FakeConnection(columns, rows)))
+
+        result = st.execute_sql("SELECT ... LIMIT 50", client_id="C001")
+
+        assert result.error is None
+        assert result.client_id == "C001"
+        assert result.row_count == 1
+        assert len(result.holdings) == 1
+        assert result.rows == []
+
+    def test_aggregate_shaped_success(self, monkeypatch):
+        columns = ["risk_profile", "AVG(market_value)"]
+        rows = [("Aggressive", 52000.0)]
+        monkeypatch.setattr(st, "agent_engine", FakeEngine(FakeConnection(columns, rows)))
+
+        result = st.execute_sql("SELECT ... LIMIT 10", client_id=None)
+
+        assert result.error is None
+        assert result.client_id is None
+        assert result.holdings == []
+        assert result.rows == [{"risk_profile": "Aggressive", "AVG(market_value)": 52000.0}]
+
+    def test_db_error_returns_result_with_error_not_raise(self, monkeypatch):
+        monkeypatch.setattr(
+            st, "agent_engine",
+            FakeEngine(FakeConnection(raise_on_execute=RuntimeError("no such column: foo"))),
+        )
+
+        result = st.execute_sql("SELECT foo FROM clients LIMIT 10", client_id=None)
+
+        assert result.error is not None
+        assert "no such column" in result.error
+        assert result.holdings == []
+        assert result.rows == []
 
 
-def test_extract_client_id_diagnostic_reversed_literal():
-    """Diagnostic, not necessarily pass/fail depending on desired scope:
-    a reversed equality ('C007' = client_id) currently is NOT matched
-    since the extraction only checks Column-on-the-left. Prints the
-    result so this gap is a visible, tracked decision rather than a
-    silent gap."""
-    sql = "SELECT * FROM clients WHERE 'C007' = clients.client_id"
-    result = st._extract_client_id(sql)
-    print(f"\nreversed-literal extraction result: {result!r} "
-          f"(currently expected to be None — widen the EQ check if the "
-          f"model is observed producing this form)")
+class TestFetchClientProfile:
+    def test_found_client_returns_profile(self, monkeypatch):
+        row = ("C001", "Faisal Al-Otaibi", "Aggressive", "HNW")
+        conn = FakeConnection(rows=[row])
+        monkeypatch.setattr(st, "agent_engine", FakeEngine(conn))
 
+        profile = st.fetch_client_profile("C001")
 
-# ---------------------------------------------------------------------------
-# 1. PURE UNIT — _map_rows
-# ---------------------------------------------------------------------------
+        assert profile == ClientProfile(
+            client_id="C001", name="Faisal Al-Otaibi", risk_profile="Aggressive", aum_tier="HNW"
+        )
 
-def test_map_rows_happy_path():
-    rows = [
-        {"symbol": "2222", "name_en": "Saudi Aramco", "quantity": 1000,
-         "market_value": 50000, "sector": "Energy"},
-        {"symbol": "1120", "name_en": "Al Rajhi Bank", "quantity": 500,
-         "market_value": 25000, "sector": "Banking"},
-    ]
-    holdings, error = st._map_rows(rows)
-    assert error is None
-    assert len(holdings) == 2
-    assert isinstance(holdings[0], ClientHolding)
-    assert holdings[0].symbol == "2222"
+    def test_unknown_client_returns_none(self, monkeypatch):
+        conn = FakeConnection(rows=[])
+        monkeypatch.setattr(st, "agent_engine", FakeEngine(conn))
 
+        assert st.fetch_client_profile("C999") is None
 
-def test_map_rows_empty_result_is_not_an_error():
-    holdings, error = st._map_rows([])
-    assert error is None
-    assert holdings == []
-
-
-def test_map_rows_regression_missing_columns_reported_not_raised():
-    """Regression: this is exactly the KeyError class of bug from the
-    eval. A wrong/missing column must come back as an error string for
-    the repair loop, never as an unhandled exception."""
-    rows = [{"ticker": "2222", "name_en": "Saudi Aramco"}]  # wrong keys
-    holdings, error = st._map_rows(rows)
-    assert holdings is None
-    assert error is not None
-    assert "symbol" in error
-    assert "quantity" in error
-
-
-def test_map_rows_partial_missing_column():
-    rows = [{"symbol": "2222", "name_en": "Saudi Aramco", "quantity": 1000,
-              "market_value": 50000}]  # sector missing
-    holdings, error = st._map_rows(rows)
-    assert holdings is None
-    assert "sector" in error
-
-
-def test_map_rows_wrong_type_reported_as_error():
-    rows = [{"symbol": "2222", "name_en": "Saudi Aramco",
-              "quantity": "not-a-number", "market_value": 50000, "sector": "Energy"}]
-    holdings, error = st._map_rows(rows)
-    assert holdings is None
-    assert error is not None
-
-
-# ---------------------------------------------------------------------------
-# 2. GENERATION — generate_query
-# ---------------------------------------------------------------------------
-
-def test_generate_query_sends_question_and_schema(fake_llm):
-    fake_llm.responses = [GeneratedQuery(sql=GOOD_SQL_C001, confidence=0.95)]
-    result = st.generate_query("show holdings for client C001")
-
-    assert result.sql == GOOD_SQL_C001
-    assert result.confidence == 0.95
-    system_msg = fake_llm.last_messages[0]["content"]
-    assert "clients(" in system_msg  # schema snapshot was injected
-    assert fake_llm.last_messages[1]["content"] == "show holdings for client C001"
-
-
-def test_generate_query_includes_prior_error_in_repair_prompt(fake_llm):
-    fake_llm.responses = [GeneratedQuery(sql=GOOD_SQL_C001, confidence=0.9)]
-    st.generate_query("show holdings for client C001",
-                       prior_error=("SELECT * FROM secrets", "disallowed table"))
-
-    system_msg = fake_llm.last_messages[0]["content"]
-    assert "SELECT * FROM secrets" in system_msg
-    assert "disallowed table" in system_msg
-
-
-# ---------------------------------------------------------------------------
-# 3. INTEGRATION — run_query_pipeline (real DB, faked LLM)
-# ---------------------------------------------------------------------------
-
-def test_pipeline_happy_path_real_db(fake_llm):
-    fake_llm.responses = [GeneratedQuery(sql=GOOD_SQL_C001, confidence=0.95)]
-    pipeline_result = st.run_query_pipeline("show holdings for client C001")
-
-    assert pipeline_result.result is not None
-    assert pipeline_result.result.error is None
-    assert pipeline_result.result.client_id == "C001"
-    assert pipeline_result.repair_attempts == 0
-    assert pipeline_result.needs_clarification is False
-    for h in pipeline_result.result.holdings:
-        assert isinstance(h, ClientHolding)
-
-
-def test_pipeline_never_executes_when_generation_flags_clarification(fake_llm):
-    """An ambiguous generated query must never be executed against the DB
-    -- the model's own uncertainty is reason enough not to touch real data,
-    even read-only. The advisor sees the clarification question either way."""
-    fake_llm.responses = [GeneratedQuery(
-        sql=GOOD_SQL_C001, confidence=0.4,
-        needs_clarification=True,
-        clarification_question="Did you mean client C001 or C010?",
-    )]
-    pipeline_result = st.run_query_pipeline("show holdings for that client")
-
-    assert pipeline_result.needs_clarification is True
-    assert pipeline_result.clarification_question == "Did you mean client C001 or C010?"
-    assert pipeline_result.result is None  # never executed
-
-
-def test_pipeline_repairs_validation_error_real_db(fake_llm):
-    """First attempt references a disallowed table; second attempt is
-    the valid query. Should self-correct within budget."""
-    fake_llm.responses = [
-        GeneratedQuery(sql="SELECT * FROM secrets", confidence=0.5),
-        GeneratedQuery(sql=GOOD_SQL_C001, confidence=0.9),
-    ]
-    pipeline_result = st.run_query_pipeline("show holdings for client C001")
-
-    assert pipeline_result.result.error is None
-    assert pipeline_result.repair_attempts == 1
-    assert fake_llm.call_count == 2
-
-
-def test_pipeline_repairs_row_mapping_error_real_db(fake_llm):
-    """First attempt has wrong column aliases (the KeyError-class bug);
-    second attempt is correct. Confirms the repair loop is actually wired
-    to the row-mapping check, not just validation/execution errors."""
-    bad_sql = (
-        "SELECT holdings.ticker, instruments.name_en, holdings.quantity "
-        "FROM holdings "
-        "JOIN clients ON holdings.client_id = clients.client_id "
-        "JOIN instruments ON holdings.ticker = instruments.ticker "
-        "WHERE clients.client_id = 'C001'"
-    )
-    fake_llm.responses = [
-        GeneratedQuery(sql=bad_sql, confidence=0.7),
-        GeneratedQuery(sql=GOOD_SQL_C001, confidence=0.9),
-    ]
-    pipeline_result = st.run_query_pipeline("show holdings for client C001")
-
-    assert pipeline_result.result.error is None
-    assert pipeline_result.repair_attempts == 1
-
-
-def test_pipeline_stops_early_on_repeated_identical_error_real_db(fake_llm):
-    """If the model produces the exact same failing SQL twice in a row,
-    the loop must stop after the first repair attempt rather than
-    burning the full budget on a query that isn't converging."""
-    bad_sql = "SELECT holdings.nonexistent_column FROM holdings WHERE holdings.client_id = 'C001'"
-    fake_llm.responses = [
-        GeneratedQuery(sql=bad_sql, confidence=0.5),
-        GeneratedQuery(sql=bad_sql, confidence=0.5),  # identical failure again
-        GeneratedQuery(sql=bad_sql, confidence=0.5),  # should never be reached
-    ]
-    pipeline_result = st.run_query_pipeline("show holdings for client C001", max_repair_attempts=3)
-
-    assert pipeline_result.result.error is not None
-    assert pipeline_result.repair_attempts == 1
-    assert fake_llm.call_count == 2  # initial + one repair, not three
-
-
-def test_pipeline_stops_at_max_attempts_with_differing_errors_real_db(fake_llm):
-    """When errors keep changing (so the identical-error shortcut never
-    fires), the loop must still respect the hard attempt cap."""
-    fake_llm.responses = [
-        GeneratedQuery(sql="SELECT holdings.bad_col_a FROM holdings WHERE holdings.client_id='C001'", confidence=0.5),
-        GeneratedQuery(sql="SELECT holdings.bad_col_b FROM holdings WHERE holdings.client_id='C001'", confidence=0.5),
-        GeneratedQuery(sql="SELECT holdings.bad_col_c FROM holdings WHERE holdings.client_id='C001'", confidence=0.5),
-    ]
-    pipeline_result = st.run_query_pipeline("show holdings for client C001", max_repair_attempts=2)
-
-    assert pipeline_result.result.error is not None
-    assert pipeline_result.repair_attempts == 2
-    assert fake_llm.call_count == 3  # initial + 2 repairs, capped
-
-
-def test_pipeline_extracts_correct_client_id_for_different_client_real_db(fake_llm):
-    sql_c002 = GOOD_SQL_C001.replace("C001", "C002")
-    fake_llm.responses = [GeneratedQuery(sql=sql_c002, confidence=0.9)]
-    pipeline_result = st.run_query_pipeline("show holdings for client C002")
-
-    assert pipeline_result.result.client_id == "C002"
+    def test_db_error_raises_sql_tool_error(self, monkeypatch):
+        monkeypatch.setattr(
+            st, "agent_engine",
+            FakeEngine(raise_on_connect=RuntimeError("db locked")),
+        )
+        with pytest.raises(st.SQLToolError, match="client profile lookup failed"):
+            st.fetch_client_profile("C001")
 
 
 # ---------------------------------------------------------------------------
-# Schema grounding sanity check (real DB)
+# run_query_pipeline -- mocks the four layers it wires together
 # ---------------------------------------------------------------------------
 
-def test_schema_snapshot_contains_all_tables_real_db():
-    snapshot = st._schema_snapshot()
-    for table in ("clients", "instruments", "holdings"):
-        assert f"{table}(" in snapshot
+class TestRunQueryPipeline:
+    def test_aggregate_question_with_client_selected_is_not_forced_to_scope(self, monkeypatch):
+        gen = GeneratedQuery(
+            sql="SELECT COUNT(*) AS n FROM clients WHERE risk_profile = 'Aggressive' LIMIT 10",
+            confidence=0.9,
+        )
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: gen)
+        monkeypatch.setattr(
+            st, "execute_sql",
+            lambda sql, client_id: SQLQueryResult(client_id=client_id, rows=[{"n": 4}], row_count=1),
+        )
 
+        outcome = st.run_query_pipeline("how many clients have Aggressive risk profile?", client_id="C001")
 
-def test_schema_snapshot_is_cached():
-    first = st._schema_snapshot()
-    second = st._schema_snapshot()
-    assert first is second  # lru_cache returns the same object, not just equal
+        assert outcome.validation_error is None
+        assert outcome.result.rows == [{"n": 4}]
+
+    def test_needs_clarification_short_circuits_before_validation(self, monkeypatch):
+        gen = GeneratedQuery(
+            sql="", confidence=0.2, needs_clarification=True,
+            clarification_question="Which time period do you mean?",
+        )
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: gen)
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("validate_sql should not be called")
+        ))
+
+        outcome = st.run_query_pipeline("some vague question")
+
+        assert outcome.needs_clarification is True
+        assert outcome.clarification_question == "Which time period do you mean?"
+        assert outcome.result is None
+
+    def test_successful_first_attempt_no_repair(self, monkeypatch):
+        gen = GeneratedQuery(sql="SELECT * FROM clients LIMIT 10", confidence=0.9)
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: gen)
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: [])
+        monkeypatch.setattr(
+            st, "execute_sql",
+            lambda *a, **k: SQLQueryResult(client_id=None, rows=[{"n": 18}], row_count=1),
+        )
+
+        outcome = st.run_query_pipeline("how many clients")
+
+        assert outcome.repair_attempts == 0
+        assert outcome.validation_error is None
+        assert outcome.result.rows == [{"n": 18}]
+
+    def test_validation_failure_retries_then_succeeds(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_generate(question, client_id=None, prior_error=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return GeneratedQuery(sql="SELECT bogus_col FROM clients LIMIT 10", confidence=0.5)
+            return GeneratedQuery(sql="SELECT client_id FROM clients LIMIT 10", confidence=0.9)
+
+        def fake_validate(sql, client_id):
+            return ["Unknown column clients.bogus_col"] if "bogus_col" in sql else []
+
+        monkeypatch.setattr(st, "generate_query", fake_generate)
+        monkeypatch.setattr(st, "validate_sql", fake_validate)
+        monkeypatch.setattr(
+            st, "execute_sql",
+            lambda *a, **k: SQLQueryResult(client_id=None, rows=[{"client_id": "C001"}], row_count=1),
+        )
+
+        outcome = st.run_query_pipeline("list client ids")
+
+        assert calls["n"] == 2
+        assert outcome.repair_attempts == 1
+        assert outcome.validation_error is None
+        assert outcome.result is not None
+
+    def test_validation_failure_exhausts_repair_budget(self, monkeypatch):
+        gen = GeneratedQuery(sql="SELECT bogus_col FROM clients LIMIT 10", confidence=0.5)
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: gen)
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: ["Unknown column clients.bogus_col"])
+        monkeypatch.setattr(
+            st, "execute_sql",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("execute_sql should not run"))
+        )
+
+        outcome = st.run_query_pipeline("a persistently bad question")
+
+        assert outcome.repair_attempts == st.MAX_REPAIR_ATTEMPTS
+        assert outcome.validation_error == "Unknown column clients.bogus_col"
+        assert outcome.result is None
+
+    def test_execution_failure_retries_then_succeeds(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_execute(sql, client_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return SQLQueryResult(client_id=client_id, error="no such column: foo")
+            return SQLQueryResult(client_id=client_id, rows=[{"ok": True}], row_count=1)
+
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: GeneratedQuery(sql="SELECT ... LIMIT 10", confidence=0.9))
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: [])
+        monkeypatch.setattr(st, "execute_sql", fake_execute)
+
+        outcome = st.run_query_pipeline("some question")
+
+        assert calls["n"] == 2
+        assert outcome.repair_attempts == 1
+        assert outcome.result.error is None
+
+    def test_client_profile_attached_only_on_client_scoped_success(self, monkeypatch):
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: GeneratedQuery(
+            sql="SELECT * FROM holdings WHERE client_id = :client_id LIMIT 10", confidence=0.9))
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: [])
+        monkeypatch.setattr(
+            st, "execute_sql",
+            lambda *a, **k: SQLQueryResult(client_id="C001", holdings=[], row_count=0),
+        )
+        fake_profile = ClientProfile(client_id="C001", name="Faisal Al-Otaibi", risk_profile="Aggressive", aum_tier="HNW")
+        monkeypatch.setattr(st, "fetch_client_profile", lambda client_id: fake_profile)
+
+        outcome = st.run_query_pipeline("this client's holdings", client_id="C001")
+
+        assert outcome.result.client_profile == fake_profile
+
+    def test_client_profile_not_attached_when_unscoped(self, monkeypatch):
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: GeneratedQuery(sql="SELECT ... LIMIT 10", confidence=0.9))
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: [])
+        monkeypatch.setattr(
+            st, "execute_sql",
+            lambda *a, **k: SQLQueryResult(client_id=None, rows=[{"n": 18}], row_count=1),
+        )
+        monkeypatch.setattr(
+            st, "fetch_client_profile",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called when unscoped"))
+        )
+
+        outcome = st.run_query_pipeline("how many clients total")
+
+        assert outcome.result.client_profile is None
+
+    def test_client_profile_not_attached_on_execution_error(self, monkeypatch):
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: GeneratedQuery(sql="SELECT ... LIMIT 10", confidence=0.9))
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: [])
+        monkeypatch.setattr(
+            st, "execute_sql",
+            lambda *a, **k: SQLQueryResult(client_id="C001", error="db down"),
+        )
+        monkeypatch.setattr(
+            st, "fetch_client_profile",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called on execution error"))
+        )
+
+        outcome = st.run_query_pipeline("this client's holdings", client_id="C001")
+
+        assert outcome.result.error == "db down"
+
+    def test_client_profile_only_attached_when_sql_actually_filters_on_client(self, monkeypatch):
+        """Regression: a client selected in session must not get their profile
+        attached to a result that was intentionally unscoped (e.g. an aggregate
+        across all clients) -- the answer LLM will otherwise narrate the
+        aggregate as if it were about that one client."""
+        monkeypatch.setattr(st, "generate_query", lambda *a, **k: GeneratedQuery(
+            sql="SELECT SUM(market_value) AS total FROM holdings LIMIT 1", confidence=0.9))
+        monkeypatch.setattr(st, "validate_sql", lambda *a, **k: [])
+        monkeypatch.setattr(st, "execute_sql", lambda *a, **k: SQLQueryResult(
+            client_id="C001", rows=[{"total": 42989894.0}], row_count=1))
+        monkeypatch.setattr(st, "fetch_client_profile", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("should not be called -- SQL never filtered on client_id")))
+
+        outcome = st.run_query_pipeline("total portfolio value across all clients", client_id="C001")
+
+        assert outcome.result.client_profile is None
+    def test_group_by_client_identity_rejected_even_with_client_selected(self):
+        """The actual injection gap: a client_id being selected in session
+        must not disable the disclosure guard for a query that doesn't
+        filter by that client. Regression for the has_client_filter fix."""
+        sql = "SELECT name, SUM(market_value) AS total FROM clients " \
+              "JOIN holdings ON clients.client_id = holdings.client_id " \
+              "GROUP BY name LIMIT 100"
+        errors = st.validate_sql(sql, client_id="C007")
+        assert any("must be aggregated" in e for e in errors)
+
+    def test_select_star_on_clients_rejected_even_with_client_selected(self):
+        """Same gap, SELECT * form -- confirms the fix isn't narrowly tied
+        to the GROUP BY case."""
+        errors = st.validate_sql("SELECT * FROM clients LIMIT 100", client_id="C007")
+        assert any("must be aggregated" in e for e in errors)
+
+    def test_legitimate_scoped_query_with_identity_columns_still_passes(self):
+        """The fix must not overcorrect: a query that DOES filter by the
+        selected client, and legitimately returns that one client's own
+        name/id, is not a disclosure -- has_client_filter should let it
+        through same as before."""
+        sql = "SELECT name, client_id FROM clients WHERE client_id = :client_id LIMIT 1"
+        assert st.validate_sql(sql, client_id="C007") == []

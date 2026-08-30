@@ -60,8 +60,13 @@ Rules:
 - If the extracts do not answer the question, say so plainly and stop. Do not
   fall back on general knowledge, and do not soften it into a vague answer that
   sounds informed.
-- If the Note at the end of the context says no research covers the client's
-  holdings, say that. That is the correct answer, not a failure.
+- Base "no research covers this" only on whether numbered extracts appear
+  above the Note -- not on the Note's wording alone. If at least one numbered
+  extract is present, answer from it, then always state explicitly which of
+  the client's other holdings have no research indexed, using the Note's
+  uncovered list -- do not simply omit them. Only say there is no research at
+  all when there are zero numbered extracts, and if you do, that is the
+  correct answer, not a failure. Do not apologise for it or soften it.
 - Reply in the language of the advisor's question. An Arabic question gets an
   Arabic answer, using the Arabic terms the extracts themselves use. Half this
   corpus is in the other language from the question, so expect to translate
@@ -110,6 +115,31 @@ def question_of(state: dict[str, Any]) -> str:
             content = last.get("content")
         return str(content if content is not None else last)
     return ""
+
+def rag_question(state: dict[str, Any]) -> str:
+    """The question RAG should answer, not necessarily the advisor's literal
+    question -- which may also ask for portfolio facts SQL already answered.
+
+    Holdings composition ("what does the client hold") is SQL's job, not
+    RAG's. Passing that clause straight into the answering prompt makes the
+    model check the extracts against a claim they were never meant to
+    support ("do these extracts say what c012 holds?") and refuse on that
+    basis, discarding research it could otherwise answer from. Retrieval
+    itself still runs on the raw question via ``retrieve`` -- only the
+    answer-composition prompt is narrowed here.
+    """
+    raw = question_of(state)
+    holdings = holdings_of(state)
+    if holdings:
+        names = ", ".join(
+            getattr(h, "name_en", "") for h in holdings if getattr(h, "name_en", "")
+        )
+        if names:
+            return (
+                f"What does recent research say about these holdings: {names}? "
+                f"(Advisor's original question, for context: {raw})"
+            )
+    return raw
 
 
 def holdings_of(state: dict[str, Any]) -> list[Any] | None:
@@ -239,7 +269,7 @@ def rag_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     try:
-        text = answer(question, result)
+        text = answer(rag_question(state), result)
     except Exception as exc:
         logger.error("rag_node could not compose an answer: %s", exc, exc_info=True)
         text = ("I found research on this but couldn't summarise it just now. "

@@ -1,245 +1,344 @@
-"""This module handles the preprocessing and normalization of natural language
-queries submitted by users before they are translated into SQL statements.
-1- llm rewrite: correct spelling mistakes, grammar, phrasing in the query
+"""Translates an advisor's question into terms that match the DB, not the
+other way around. Sits between the advisor's raw question and SQL generation --
+see agents/sql_agent.py.
 
-2- fuzzy matching: pull vocab from db and do token-level matching to correct
-values that may have typos with the actual db values format. Covers both
-single-token categorical fields and multi-word phrase/entity fields.
+The DB stores client names and enum values (risk_profile, aum_tier) as Latin
+strings; ``instruments`` is the only table with a genuine Arabic column
+(``name_ar``). An Arabic question routinely needs to reference all of these,
+so this cannot be a lookup against one table -- it has to be a translation
+grounded in whatever values actually exist across the schema, generated fresh
+rather than hand-mapped. A hardcoded Arabic-phrase dictionary only covers the
+phrasing someone thought to add; grounding on live distinct values means a new
+sector or instrument needs no rewriter change to be handled correctly.
 
-3- ambiguity detection: when a fuzzy match ties between two or more real
-values, do NOT guess — surface it for clarification instead. A confident
-wrong guess against client/portfolio data is worse than asking the user.
+Client-name resolution is the one case that stays best-effort: instrument
+names and enum values are closed sets pulled straight from their columns, but
+a client's name has no Arabic-script counterpart in the DB at all -- only a
+Latin transliteration -- so matching "فيصل العتيبي" to "Faisal Al-Otaibi" is
+open-ended in a way the other two are not. In practice this rarely matters:
+``client_id`` normally comes from session state (see graph/state.py), not
+parsed out of the question, so this path only fires when a question names a
+client explicitly.
 """
 
-from pydantic import BaseModel
+from __future__ import annotations
+
+import difflib
+from functools import lru_cache
+from typing import Optional
+
 from sqlalchemy import text
-from rapidfuzz import process, fuzz
-from tools.llm import get_llm, text_of
+
 from tools.db import agent_engine
+from tools.llm import get_llm
 from schemas import RewrittenQuery
 
-import re
-import unicodedata
 
-# Arabic text can encode visually identical characters differently
-# (composed vs decomposed forms, tatweel/kashida elongation, diacritics)
-# depending on how the source data was authored. Two strings that look
-# identical to a person can fail to match at all under raw byte
-# comparison. Normalizing before every fuzzy comparison -- the same
-# role str.lower plays for the categorical fields -- prevents a real
-# substring match (like "السعودية" inside "السعودية للكهرباء") from
-# being silently invisible to the scorer.
-_ARABIC_DIACRITICS = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u0640]")
-
-def _normalize_arabic(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = _ARABIC_DIACRITICS.sub("", text)
-    return text
-
-REWRITE_SYSTEM_PROMPT = """You correct spelling, grammar, and phrasing in a user's
-question about client portfolio data. Do NOT change the meaning, add filters,
-or guess at entity values (client IDs, names, sectors) — just fix language.
-Return ONLY the corrected question text, nothing else."""
+class QueryRewriterError(RuntimeError):
+    """Raised when the rewriter cannot run at all -- no grounding data, no model."""
 
 
-def llm_rewrite(question: str) -> str:
-    llm = get_llm()
-    resp = llm.invoke([
-        {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ])
-    # Gemini can return empty content for prompts it flags as adversarial/
-    # unsafe (e.g. SQL-injection-looking text) rather than raising an
-    # exception. An empty rewritten question would otherwise propagate
-    # downstream into generate_query's LLM call and crash the whole
-    # pipeline with "contents are required" -- fall back to the original
-    # question text instead of ever returning "".
-    content = text_of(resp)
-    return content if content else question
+# How close a model-resolved value has to be to a real DB value to be accepted
+# as a near-miss correction rather than rejected outright. 0.8 catches typos
+# and minor casing/spacing drift ("SABIK" -> "SABIC") without accepting a
+# different instrument entirely.
+FUZZY_CUTOFF = 0.8
 
 
-CATEGORICAL_FIELDS = {
-    "client_id": ("clients", "client_id"),
-    "risk_profile": ("clients", "risk_profile"),
-    "aum_tier": ("clients", "aum_tier"),
-    "sector": ("instruments", "sector"),
-    "ticker": ("instruments", "ticker"),
-}
+@lru_cache(maxsize=1)
+def _raw_grounding() -> dict[str, list]:
+    """One DB round trip, shared by the prompt text and the verification set.
 
-ENTITY_FIELDS = {
-    "client_name": ("clients", "name"),
-    "instrument_name_en": ("instruments", "name_en"),
-    "instrument_name_ar": ("instruments", "name_ar"),
-}
-
-# How many points below the top score still counts as "tied" when deciding
-# whether an entity match is ambiguous. Strict equality is too strict for
-# fuzzy partial-ratio scores: the same kind of generic/shared fragment (a
-# nationality adjective, a common surname, a word like "Bank") can score a
-# couple of points differently purely because of the length of the
-# surrounding candidate string -- that difference doesn't reflect a real
-# difference in how ambiguous the match actually is, so a small tolerance
-# band is used instead of an exact score match.
-TIE_TOLERANCE = 5.0
-
-
-def _load_distinct_values(table: str, column: str) -> list[str]:
-    with agent_engine.connect() as conn:
-        rows = conn.execute(text(f"SELECT DISTINCT {column} FROM {table}")).fetchall()
-    return [r[0] for r in rows if r[0]]
-
-
-def _load_known_values() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    categorical = {
-        field: _load_distinct_values(table, col)
-        for field, (table, col) in CATEGORICAL_FIELDS.items()
-    }
-    entities = {
-        field: _load_distinct_values(table, col)
-        for field, (table, col) in ENTITY_FIELDS.items()
-    }
-    return categorical, entities
+    Cached once per process -- same reasoning as rag_tools.catalog(): static
+    mock CSVs, re-querying per question is pure waste. Call
+    ``_raw_grounding.cache_clear()`` if the CSVs change without a restart.
+    """
+    try:
+        with agent_engine.connect() as conn:
+            return {
+                "instruments": conn.execute(text(
+                    "SELECT ticker, name_en, name_ar FROM instruments"
+                )).fetchall(),
+                "clients": conn.execute(text(
+                    "SELECT client_id, name FROM clients"
+                )).fetchall(),
+                "risk_profiles": [r[0] for r in conn.execute(text(
+                    "SELECT DISTINCT risk_profile FROM clients"
+                )).fetchall()],
+                "aum_tiers": [r[0] for r in conn.execute(text(
+                    "SELECT DISTINCT aum_tier FROM clients"
+                )).fetchall()],
+                "sectors": [r[0] for r in conn.execute(text(
+                    "SELECT DISTINCT sector FROM instruments"
+                )).fetchall()],
+                "asset_classes": [r[0] for r in conn.execute(text(
+                    "SELECT DISTINCT asset_class FROM instruments"
+                )).fetchall()],
+            }
+    except Exception as exc:
+        raise QueryRewriterError(f"could not load grounding values from the DB:\n{exc}") from exc
 
 
-def _tied_top_matches(candidate: str, values: list[str], scorer, processor=None) -> tuple[set[str], float]:
-    """Every real value that ties for the top score against `candidate`,
-    and that score. len(tied) > 1 means multiple real values are equally
-    close — a genuine ambiguity, not just 'the closest one' being slightly
-    better. Shared by both correction functions below so production
-    behavior and anything testing it can never drift apart."""
-    results = process.extract(candidate, values, scorer=scorer, processor=processor, limit=None)
-    if not results:
-        return set(), 0
-    top_score = results[0][1]
-    tied = {r[0] for r in results if r[1] == top_score}
-    return tied, top_score
+def _grounding() -> str:
+    """The raw grounding, formatted for the prompt."""
+    raw = _raw_grounding()
+    lines = ["Instruments (ticker | English name | Arabic name):"]
+    lines += [f"- {t} | {en} | {ar}" for t, en, ar in raw["instruments"]]
+    lines.append("")
+    lines.append("Clients (client_id | name, Latin transliteration):")
+    lines += [f"- {cid} | {name}" for cid, name in raw["clients"]]
+    lines.append("")
+    lines.append("risk_profile values: " + ", ".join(sorted(raw["risk_profiles"])))
+    lines.append("aum_tier values: " + ", ".join(sorted(raw["aum_tiers"])))
+    lines.append("sector values: " + ", ".join(sorted(raw["sectors"])))
+    lines.append("asset_class values: " + ", ".join(sorted(raw["asset_classes"])))
+    return "\n".join(lines)
 
 
-def fuzzy_correct_categorical(question: str, categorical: dict[str, list[str]],
-                               threshold: int = 85) -> tuple[str, list[str], list[str]]:
-    """Token-level correction for single-word bounded-vocabulary fields.
-    Scoring is case-insensitive (processor=str.lower) so pure-case typos like
-    'c007' vs 'C007' are found; the correction decision is case-sensitive
-    (best_match != stripped) so a pure-case fix still counts as a real
-    change. Competition is across ALL categorical values (not just one
-    field) since that's what a real query token could plausibly refer to.
-    When a candidate ties between two or more real values, it is left
-    uncorrected and reported in `ambiguous` instead of guessed."""
-    corrections = []
-    ambiguous = []
-    tokens = question.split()
-    corrected_tokens = []
+def _known_values() -> set[str]:
+    """Every real DB value a rewritten reference could legitimately resolve to.
 
-    all_values = [v for values in categorical.values() for v in values]
-    value_to_field = {v: field for field, values in categorical.items() for v in values}
+    Pooled into one flat set rather than checked column-by-column: the
+    verification step only needs to know "is this a real value anywhere
+    relevant", not which column it came from -- the SQL generator figures out
+    the column from context, same as it already does for anything else in the
+    rewritten question.
+    """
+    raw = _raw_grounding()
+    values: set[str] = set()
+    for ticker, name_en, name_ar in raw["instruments"]:
+        values.update({ticker, name_en, name_ar})
+    for client_id, name in raw["clients"]:
+        values.update({client_id, name})
+    values.update(raw["risk_profiles"])
+    values.update(raw["aum_tiers"])
+    values.update(raw["sectors"])
+    values.update(raw["asset_classes"])
+    return values
 
-    for token in tokens:
-        stripped = token.strip(".,?!")
-        tied, score = _tied_top_matches(stripped, all_values, fuzz.ratio, str.lower)
 
-        if not tied or score < threshold:
-            corrected_tokens.append(token)
+def _try_resolve(term: str, known: set[str]) -> Optional[str]:
+    """Attempt to resolve one term against real DB values: exact match,
+    then a close-typo fuzzy match, then unique-substring containment
+    (a short name like "Noura" against a full "Noura Al-Zahrani").
+
+    Order matters: fuzzy runs before substring so a genuine near-miss typo
+    ("SABIK") is corrected to the right value ("SABIC") rather than being
+    mistaken for a substring of something else. Substring only fires when
+    exactly one known value contains the term, so an ambiguous partial
+    reference (matching two different clients, say) is never silently
+    guessed -- it stays unresolved instead.
+    """
+    if term in known:
+        return term
+    close = difflib.get_close_matches(term, known, n=1, cutoff=FUZZY_CUTOFF)
+    if close:
+        return close[0]
+    substring_hits = [
+        v for v in known
+        if term.lower() in v.lower() and term.lower() != v.lower()
+    ]
+    if len(substring_hits) == 1:
+        return substring_hits[0]
+    return None
+
+
+def _verify_corrections(result: RewrittenQuery) -> RewrittenQuery:
+    """Check every correction the model made against real DB values, and
+    attempt to rescue anything the model itself flagged as ambiguous.
+
+    The model is asked to only resolve references it can match exactly, but
+    nothing enforces that on its own -- a confident near-miss ("SABIK" instead
+    of "SABIC") would otherwise reach SQL generation looking exactly like a
+    verified match, and fail later at execution instead of here where the
+    failure is cheap and specific. This is the deterministic floor under the
+    model's own judgment, not a replacement for it.
+
+    Pre-existing ``ambiguous`` entries get the same rescue attempt as failed
+    corrections: a short reference like "Noura" often never becomes a
+    ``corrections`` entry at all -- the model, told not to guess, puts it
+    straight into ``ambiguous`` -- so resolving it has to happen here too,
+    not only on the corrections side.
+    """
+    known = _known_values()
+    kept_corrections: list[str] = []
+    new_ambiguous: list[str] = []
+    needs_clarification = result.needs_clarification
+
+    for correction in result.corrections:
+        if "->" not in correction:
+            kept_corrections.append(correction)
             continue
+        original, resolved = (part.strip() for part in correction.split("->", 1))
 
-        if len(tied) == 1:
-            best_match = next(iter(tied))
-            if best_match != stripped:
-                field = value_to_field[best_match]
-                corrections.append(f"'{stripped}' -> '{best_match}' ({field}, {score:.1f}%)")
-                corrected_tokens.append(token.replace(stripped, best_match))
-            else:
-                corrected_tokens.append(token)
+        if original.lower() == resolved.lower():
+            continue  # no-op "correction" -- not a real substitution
+
+        resolved_final = _try_resolve(resolved, known)
+        if resolved_final:
+            kept_corrections.append(f"{original} -> {resolved_final}")
         else:
-            candidates = sorted(tied)
-            ambiguous.append(
-                f"'{stripped}' is ambiguous ({score:.1f}%) between: {', '.join(candidates)} — not auto-corrected"
-            )
-            corrected_tokens.append(token)
+            new_ambiguous.append(correction)
+            needs_clarification = True
 
-    return " ".join(corrected_tokens), corrections, ambiguous
-
-
-def fuzzy_correct_entities(question: str, entities: dict[str, list[str]],
-                            threshold: int = 85) -> tuple[str, list[str], list[str]]:
-    """Whole-phrase / sliding-window matching for multi-word proper nouns.
-    Tries every window size and keeps the one that produces the HIGHEST
-    top score, rather than the largest window that merely clears the
-    threshold -- a large window that happens to mix in filler words
-    (e.g. "related to <name>") can dilute partial_ratio's score below
-    what the exact fragment alone would achieve, so "largest first" alone
-    can pick a noisier, lower-confidence match over a cleaner one."""
-    corrections = []
-    ambiguous = []
-    tokens = [t.strip(".,?!") for t in question.split()]
-    n = len(tokens)
-
-    for field, values in entities.items():
-        max_words = max(len(v.split()) for v in values)
-
-        best_overall_score = -1.0
-        best_overall_scores: dict[str, float] = {}
-
-        for window_size in range(1, min(max_words, n) + 1):
-            best_score_per_value: dict[str, float] = {}
-
-            for i in range(n - window_size + 1):
-                candidate = " ".join(tokens[i:i + window_size])
-                if len(candidate) < 3:
-                    continue
-                for match, score, _ in process.extract(
-                    candidate, values, scorer=fuzz.partial_ratio, limit=None
-                ):
-                    if score > best_score_per_value.get(match, 0):
-                        best_score_per_value[match] = score
-
-            if not best_score_per_value:
-                continue
-
-            window_top_score = max(best_score_per_value.values())
-            if window_top_score > best_overall_score:
-                best_overall_score = window_top_score
-                best_overall_scores = best_score_per_value
-
-        if best_overall_score < threshold:
-            continue
-
-        tied = sorted(
-            v for v, s in best_overall_scores.items()
-            if best_overall_score - s <= TIE_TOLERANCE
-        )
-
-        if len(tied) == 1:
-            match = tied[0]
-            if match.lower() not in question.lower():
-                corrections.append(
-                    f"possible entity match: '{match}' ({field}, {best_overall_score:.1f}%) — not auto-replaced"
-                )
+    for entry in result.ambiguous:
+        term = entry.split("->", 1)[0].strip() if "->" in entry else entry
+        resolved_final = _try_resolve(term, known)
+        if resolved_final:
+            kept_corrections.append(f"{term} -> {resolved_final}")
         else:
-            ambiguous.append(
-                f"possible entity match is ambiguous ({field}, {best_overall_score:.1f}%) between: "
-                f"{', '.join(tied)} — not auto-replaced"
-            )
+            new_ambiguous.append(entry)
+            needs_clarification = True
 
-    return question, corrections, ambiguous
+    return result.model_copy(update={
+        "corrections": kept_corrections,
+        "ambiguous": new_ambiguous,
+        "needs_clarification": needs_clarification,
+    })
 
-def rewrite_question(question: str) -> RewrittenQuery:
-    llm_fixed = llm_rewrite(question)
 
-    categorical, entities = _load_known_values()
+SYSTEM_PROMPT = """\
+You rewrite an advisor's question so every reference in it matches a value
+that actually exists in the database below -- exact spelling, exact casing.
 
-    step1, cat_corrections, cat_ambiguous = fuzzy_correct_categorical(llm_fixed, categorical)
-    step2, entity_notes, entity_ambiguous = fuzzy_correct_entities(step1, entities)
+You are not answering the question. You are translating references in it:
+- A company mentioned in Arabic or English -> its ticker.
+- A risk tolerance, AUM tier, sector, or asset class *value* mentioned in
+  Arabic or English, or informally -> the exact column value listed below
+  (e.g. "aggressive risk" -> "Aggressive").
+- A client named in the question -> the client_id, only if you are confident
+  which client is meant.
+- If every entity in the question (client, company, value) matches correctly
+  but the question asks for information this schema doesn't have at all
+  (e.g. a home address, a phone number, anything not in the tables listed),
+  do not flag the correctly-matched entity as ambiguous. Leave the question
+  as rewritten and let it fail downstream where "no such column" belongs,
+  rather than reporting a real match as unmatched.
+  
 
-    all_corrections = cat_corrections + entity_notes
-    if llm_fixed != question:
-        all_corrections.insert(0, f"language: '{question}' -> '{llm_fixed}'")
+Database values:
+{grounding}
 
-    all_ambiguous = cat_ambiguous + entity_ambiguous
+Rules:
+- Only rewrite references that map to something in the list above. Do not
+  invent tickers, IDs, or values that are not listed.
+- If a reference in the question does not clearly match anything above, leave
+  it in the rewritten question as-is and list it in `ambiguous`. Do not guess.
+- `corrections` is ONLY for data-value substitutions you can verify against
+  the list above -- a ticker, a client_id, or an exact enum value (like
+  "Conservative" or "HNW"). Each entry's resolved side must be copied
+  verbatim from the list above, nothing else.
+- Do NOT put column-name or field-name translations in `corrections` (e.g.
+  translating "risk level"/"مستوى المخاطرة" to the concept of risk_profile is
+  just phrasing the rewritten question in English/normal terms -- it is not a
+  value substitution and must not appear in `corrections`).
+- When substituting a ticker into the rewritten question text itself, phrase
+  it as "ticker 2010" or "the instrument with ticker 2010" so a reader with
+  no access to this rewrite step cannot mistake it for a year -- but the
+  `corrections` entry for that same substitution must still show the bare
+  ticker on the resolved side, e.g. "سابك -> 2010", not the full phrase.
+- Set `needs_clarification=true` only if an unresolved reference is essential
+  to answering the question (e.g. an unmatched company or client). A vague but
+  answerable question does not need clarification.
+- The rewritten question should read naturally, in the same language as the
+  original, with only the resolved terms substituted in.
+  - Set `wants_research` to true if the question asks for anything beyond raw
+  data about the holdings themselves -- research, risk assessment, opinion,
+  sentiment, "should [client] be worried", "what does research say" -- in
+  addition to or instead of just retrieving the positions. A question that
+  only asks what a client holds, without asking for any judgment or research
+  on those positions, leaves this false.
+"""
 
-    return RewrittenQuery(
-        original=question,
-        rewritten=step2,
-        corrections=all_corrections,
-        ambiguous=all_ambiguous,
-        needs_clarification=bool(all_ambiguous),
+USER_PROMPT = "Advisor's question:\n{question}"
+
+
+@lru_cache(maxsize=1)
+def _rewriter_llm():
+    return get_llm().with_structured_output(RewrittenQuery)
+
+
+def rewrite_query(question: str, client_selected: bool = False) -> RewrittenQuery:
+    """Ground an advisor's question against the DB's actual values.
+
+    client_selected tells the model a client is already chosen in this
+    session, so a generic reference to "this client"/"the client" (in any
+    language) is not something to resolve by name -- it's resolved by
+    session context downstream, in tools/sql_tools.py's CLIENT_SCOPED_RULE.
+    Without this flag the rewriter tries to match "this client" against real
+    client names, fails, and wrongly demands clarification for a perfectly
+    answerable question.
+    """
+    question = question.strip()
+    if not question:
+        raise QueryRewriterError("a question to rewrite cannot be empty")
+
+    grounding = _grounding()
+    client_note = (
+        "\nA client is already selected in this session. Do not flag generic "
+        "references to that client ('this client', 'the client', 'my client', "
+        "'their', or equivalents in any language) as ambiguous -- those are "
+        "resolved by context, not by name. Only flag an unresolved reference "
+        "if the question names a *specific* client or company you cannot "
+        "match in the list above.\n"
+        if client_selected else ""
     )
+    messages = [
+        ("system", SYSTEM_PROMPT.format(grounding=grounding) + client_note),
+        ("user", USER_PROMPT.format(question=question)),
+    ]
+
+    try:
+        result = _rewriter_llm().invoke(messages)
+    except Exception as exc:
+        raise QueryRewriterError(f"rewrite failed:\n{exc}") from exc
+
+    if not isinstance(result, RewrittenQuery):
+        raise QueryRewriterError(f"model did not return a RewrittenQuery: {result!r}")
+
+    result = result.model_copy(update={"original": question})
+    return _verify_corrections(result)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Rewrite a question from the command line.
+
+        uv run python -m tools.query_rewriter "ما هي مقتنيات العميل في قطاع البنوك؟"
+        uv run python -m tools.query_rewriter "this client's holdings" --client-selected
+    """
+    import argparse
+    import sys
+
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(
+        prog="tools.query_rewriter",
+        description="Ground an advisor's question against actual DB values.",
+    )
+    parser.add_argument("question")
+    parser.add_argument("--client-selected", action="store_true",
+                        help="simulate a client already being selected in session")
+    args = parser.parse_args(argv)
+
+    try:
+        result = rewrite_query(args.question, client_selected=args.client_selected)
+    except QueryRewriterError as exc:
+        print("FAILED")
+        print(str(exc))
+        return 1
+
+    print(f"Original:  {result.original}")
+    print(f"Rewritten: {result.rewritten}")
+    if result.corrections:
+        print("Corrections:")
+        for c in result.corrections:
+            print(f"  - {c}")
+    if result.ambiguous:
+        print("Ambiguous:")
+        for a in result.ambiguous:
+            print(f"  - {a}")
+    print(f"needs_clarification: {result.needs_clarification}")
+    print(f"wants_research: {result.wants_research}")
+    return 0
+if __name__ == "__main__":
+    raise SystemExit(main())
